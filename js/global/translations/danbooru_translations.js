@@ -5,6 +5,8 @@
 
 export const danbooruTranslations = {
     zh: {
+        offlineManagement: "离线管理",
+        offlineManagementDescription: "管理 D 站联网模式、历史记录、本地搜索与离线缓存。操作立即生效，无需点击保存；取消不会撤销已执行的离线操作。G 站暂不支持此功能。",
         // 搜索和控制
         searchPlaceholder: "Tags (最多2个, 例如: 1girl, blue_eyes) - 第三个及后续tag将被忽略...",
         categories: "类别",
@@ -156,6 +158,8 @@ export const danbooruTranslations = {
         selectedCount: "已选择 {count} 张",
     },
     en: {
+        offlineManagement: "Offline management",
+        offlineManagementDescription: "Manage Danbooru connection mode, history, local search and offline cache. Actions apply immediately without Save; Cancel does not undo them. Gelbooru is not supported yet.",
         // 搜索和控制
         searchPlaceholder: "Tags (Max 2, e.g., 1girl, blue_eyes) - Third and subsequent tags will be ignored...",
         categories: "Categories",

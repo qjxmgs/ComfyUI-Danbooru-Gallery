@@ -1743,6 +1743,15 @@ app.registerExtension({
                     preloadSection.appendChild(gelbooruDedupDiv);
                     preloadSection.appendChild(globalLogDiv);
 
+                    const offlineSection = $el("div.danbooru-settings-section", {
+                        style: { padding: "16px", border: "1px solid var(--input-border-color)", borderRadius: "8px", backgroundColor: "var(--comfy-input-bg)" },
+                    }, [
+                        $el("h3", { textContent: t('offlineManagement'), style: { margin: "0 0 12px", color: "var(--comfy-input-text)" } }),
+                        $el("p", { textContent: t('offlineManagementDescription'), style: { color: "#999", fontSize: "13px", lineHeight: "1.6", margin: "0 0 16px" } }),
+                        offlineBar,
+                    ]);
+                    updateOfflineVisibility();
+
                     // 创建侧边栏按钮和内容区域的映射
                     const sections = {
                         'general': { title: t('generalSection'), icon: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></svg>', elements: [languageSection] },
@@ -1751,6 +1760,7 @@ app.registerExtension({
                         'prompt': { title: t('promptSection'), icon: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon></svg>', elements: [filterSection] },
                         'ui': { title: t('uiSection'), icon: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>', elements: [autocompleteSection, tooltipSection, selectionModeSection] },
                         'preload': { title: "预加载", icon: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>', elements: [preloadSection] },
+                        'offline': { title: t('offlineManagement'), icon: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/></svg>', elements: [offlineSection] },
                     };
 
                     const setActiveSection = (key) => {
@@ -4936,7 +4946,7 @@ app.registerExtension({
 
                 // 将包含搜索框和建议面板的容器添加到总控件中
                 const offlineBar = $el("div.danbooru-offline-controls", {
-                    style: { display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center', padding: '4px 0' },
+                    style: { display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center', padding: '4px 0' },
                 });
                 offlineMessage = $el('span', { textContent: '在线浏览 · 历史数据与缩略图保存在本地',
                     style: { flex: '1 1 100%', fontSize: '12px', color: 'var(--comfy-input-text)' } });
@@ -5043,7 +5053,7 @@ app.registerExtension({
                     }), offlineMessage);
                 const updateOfflineVisibility = () => { offlineBar.style.display = sourceSelect.value === 'gelbooru' ? 'none' : 'flex'; };
                 sourceSelect.addEventListener('change', updateOfflineVisibility);
-                container.appendChild(offlineBar);
+
                 container.appendChild($el("div.danbooru-controls", [searchContainer, sourceSelect, displayAllSiteContentToggle, rankingButton, favoritesButton, ratingSelect, categoryDropdown, formattingDropdown, filterButton, clearSelectionButton, settingsButton, refreshButton]));
 
                 // 🔧 重要：在 searchInput 被添加到 DOM 之后才创建智能补全实例
@@ -5666,6 +5676,24 @@ $el("style", {
        transform: translate(-50%, -50%);
    }
 
+    .danbooru-settings-section .danbooru-offline-controls > button,
+    .danbooru-settings-section .danbooru-offline-controls > select {
+        box-sizing: border-box;
+        min-height: 38px;
+        padding: 8px 12px;
+        border: 1px solid var(--input-border-color);
+        border-radius: 6px;
+        background: var(--comfy-menu-bg);
+        color: var(--comfy-input-text);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+    }
+    .danbooru-settings-section .danbooru-offline-controls > button:hover {
+        background: rgba(123, 104, 238, 0.2);
+        border-color: #7B68EE;
+        transform: none;
+    }
     .danbooru-gallery { width: 100%; display: flex; flex-direction: column; min-height: 200px; position: relative; }
     .danbooru-pagination-controls {
         display: inline-flex;
