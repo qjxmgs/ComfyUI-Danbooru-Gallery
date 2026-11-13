@@ -23,6 +23,8 @@ from ..utils.logger import get_logger
 from .site_adapters import get_site_adapter
 from .site_clients import DanbooruHttpClient, GelbooruHttpClient
 from .post_cache import get_gallery_post_cache
+from .thumbnail_cache import get_thumbnail, save_thumbnail
+from .offline_routes import OfflineGallery
 from ..shared.translation.translation_loader import get_translation_loader
 from functools import partial
 
@@ -590,6 +592,11 @@ async def add_favorite(request):
         post_id = data.get("post_id")
         source = data.get("source", "danbooru")
         adapter = get_site_adapter(source)
+        if adapter.key == "danbooru":
+            scope, store = offline_gallery.scope(request)
+            if await offline_gallery.is_local(scope, store):
+                return web.json_response({"success": False, "connected": False, "favorites": [], "error": "仅本地浏览，需手动重试联网"})
+
 
         if not post_id:
             return web.json_response({"success": False, "error": "缺少post_id"})
@@ -704,6 +711,11 @@ async def remove_favorite(request):
         post_id = data.get("post_id")
         source = data.get("source", "danbooru")
         adapter = get_site_adapter(source)
+        if adapter.key == "danbooru":
+            scope, store = offline_gallery.scope(request)
+            if await offline_gallery.is_local(scope, store):
+                return web.json_response({"success": False, "connected": False, "favorites": [], "error": "仅本地浏览，需手动重试联网"})
+
 
         if not post_id:
             return web.json_response({"success": False, "error": "缺少post_id"})
@@ -837,6 +849,11 @@ async def get_favorites_route(request):
     try:
         source = request.query.get("source") or load_ui_settings().get("source_site", "danbooru")
         adapter = get_site_adapter(source)
+        if adapter.key == "danbooru":
+            scope, store = offline_gallery.scope(request)
+            if await offline_gallery.is_local(scope, store):
+                return web.json_response({"success": False, "connected": False, "favorites": [], "error": "仅本地浏览，需手动重试联网"})
+
         if adapter.key == "gelbooru":
             user_id, gelbooru_api_key = load_gelbooru_auth()
             if not user_id or not gelbooru_api_key:
@@ -919,6 +936,11 @@ async def check_network(request):
     try:
         source = request.query.get("source") or load_ui_settings().get("source_site", "danbooru")
         adapter = get_site_adapter(source)
+        if adapter.key == "danbooru":
+            scope, store = offline_gallery.scope(request)
+            if await offline_gallery.is_local(scope, store):
+                return web.json_response({"success": False, "connected": False, "favorites": [], "error": "仅本地浏览，需手动重试联网"})
+
         is_connected, is_network_error, error_payload = await _run_http_request(
             check_network_connection,
             adapter.key,
@@ -1232,6 +1254,17 @@ async def image_proxy(request):
     if not any(host == suffix or host.endswith(f".{suffix}") for suffix in allowed_suffixes):
         return web.Response(status=403, text="host not allowed")
 
+    if host == "donmai.us" or host.endswith(".donmai.us"):
+        scope, store = offline_gallery.scope(request)
+        if await offline_gallery.is_local(scope, store):
+            return web.Response(status=409, text="离线模式未缓存原图，请手动重试联网")
+
+    thumbnail = request.query.get("thumbnail") == "1"
+    if thumbnail:
+        cached = await asyncio.to_thread(get_thumbnail, url)
+        if cached is not None:
+            return web.Response(body=cached, content_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
     async with _get_image_proxy_semaphore():
         try:
             if host == "gelbooru.com" or host.endswith(".gelbooru.com"):
@@ -1266,8 +1299,17 @@ async def image_proxy(request):
         logger.warning(f"[ImageProxy] 上游返回非媒体内容 {content_type}: {url}")
         return web.Response(status=502, text="upstream returned non-media content")
 
+    body = resp.content
+    if thumbnail:
+        try:
+            body = await asyncio.to_thread(save_thumbnail, url, body)
+            content_type = "image/jpeg"
+        except (OSError, ValueError) as error:
+            logger.warning(f"[Thumbnail] Decode failed: {error}")
+            return web.Response(status=502, text="thumbnail unavailable")
+
     return web.Response(
-        body=resp.content,
+        body=body,
         headers={
             "Content-Type": content_type,
             "Cache-Control": "public, max-age=86400",
@@ -1275,6 +1317,10 @@ async def image_proxy(request):
     )
 
 # --- 保留文件中剩余的其他部分 ---
+offline_gallery = OfflineGallery(PromptServer.instance, load_user_auth, _danbooru_request,
+                                 _image_proxy_headers_for_host, translation_system)
+
+
 @PromptServer.instance.routes.get("/danbooru_gallery/posts")
 async def get_posts_for_front(request):
     query = request.query
@@ -1289,6 +1335,25 @@ async def get_posts_for_front(request):
     gelbooru_dedup_mode = query.get("gelbooru_dedup_mode", "off").strip().lower()
     if gelbooru_dedup_mode not in ("off", "on", "on_auth"):
         gelbooru_dedup_mode = "off"
+
+    if source == "danbooru":
+        async def load_online():
+            adapter = get_site_adapter("danbooru")
+            ratings = [r.strip() for r in rating.split(",") if r.strip() and r != "all"]
+            rating_query = " ".join(("~" if len(ratings) > 1 else "") + "rating:" + r for r in ratings)
+            params = adapter.build_posts_params(tags, max(1, min(200, int(limit))), int(page), rating_query)
+            if before_id_raw:
+                params["page"] = f"b{before_id_raw}"
+            username, api_key = load_user_auth()
+            auth = HTTPBasicAuth(username, api_key) if username and api_key else None
+            response = await asyncio.to_thread(_danbooru_request, "GET", adapter.posts_url,
+                                               params=params, auth=auth, timeout=(8, 15))
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("Danbooru returned a non-list response")
+            return [{**post, "source_site": "danbooru"} for post in payload]
+        return await offline_gallery.posts(request, load_online)
 
     # Network and HTML parsing are synchronous. Keep them off aiohttp's event
     # loop so settings/favorites calls and a newly selected source stay
@@ -1337,6 +1402,11 @@ async def get_autocomplete(request):
             threshold = load_ui_settings()["autocomplete_min_post_count"]
             results = await asyncio.to_thread(translation_system.search_english, query, limit, threshold)
             return web.json_response(results)
+
+        if adapter.key == "danbooru":
+            scope, store = offline_gallery.scope(request)
+            if await offline_gallery.is_local(scope, store):
+                return web.json_response([])
 
         # 加载配置
         config = load_autocomplete_config()
@@ -1510,6 +1580,7 @@ async def save_ui_settings_route(request):
             "autocomplete_enabled": data.get("autocomplete_enabled", True),
             "tooltip_enabled": data.get("tooltip_enabled", True),
             "autocomplete_max_results": data.get("autocomplete_max_results", 20),
+            "autocomplete_min_post_count": data.get("autocomplete_min_post_count", load_ui_settings()["autocomplete_min_post_count"]),
             "selected_categories": data.get("selected_categories", ["copyright", "character", "general"]),
             "multi_select_enabled": data.get("multi_select_enabled", False),
             "source_site": data.get("source_site", "danbooru"),
@@ -1661,6 +1732,11 @@ async def get_autocomplete_with_translation(request):
             threshold = load_ui_settings()["autocomplete_min_post_count"]
             results = await asyncio.to_thread(translation_system.search_english, query, limit, threshold)
             return web.json_response(results)
+
+        if adapter.key == "danbooru":
+            scope, store = offline_gallery.scope(request)
+            if await offline_gallery.is_local(scope, store):
+                return web.json_response([])
 
         # 加载配置
         config = load_autocomplete_config()
@@ -1826,6 +1902,7 @@ class DanbooruGalleryNode:
         return selection_data or ""
 
     def get_selected_data(self, selection_data="{}", **kwargs):
+        offline_gallery.check_image_output(selection_data)
         images = []
         prompts = []
 

@@ -349,6 +349,25 @@ app.registerExtension({
                 const nodeInstanceId = crypto.randomUUID ? crypto.randomUUID() : 'node_' + Math.random().toString(36).slice(2, 10);
                 // 标记自己为最后活跃节点（自己节点上的任何交互都更新全局指针）
                 const markActive = () => { window.__lastActiveGalleryNodeId = nodeInstanceId; };
+                let offlineMode = "auto";
+                let offlineScope = "";
+                let offlinePaused = false;
+                let offlineSearch = false;
+                let offlineHistory = "";
+                let offlineHistoryQuery = "";
+                let offlineRetry = false;
+                let offlineFavoritesLoaded = false;
+                let offlineMessage = null;
+                let offlineModeSelect = null;
+                const usingLocal = () => (uiSettings.source_site || "danbooru") === "danbooru" && (offlineMode === "local" || offlinePaused || offlineSearch || Boolean(offlineHistory));
+                const offlineNotice = (message) => { if (offlineMessage) offlineMessage.textContent = message; };
+                const requireOnlineMedia = (post) => {
+                    if (post.source_site !== "gelbooru" && usingLocal()) {
+                        showToast("原图和在线收藏需要联网；离线仍可编辑、复制提示词。", "info");
+                        return false;
+                    }
+                    return true;
+                };
                 let filterState = { startTime: null, endTime: null, startPage: null };
                 let userAuth = { username: "", api_key: "", has_auth: false, gelbooru_user_id: "", gelbooru_api_key: "", gelbooru_has_auth: false }; // 用户认证信息
                 let userFavorites = []; // 用户收藏列表，确保字符串
@@ -395,6 +414,26 @@ app.registerExtension({
                         });
                         const data = await response.json();
                         if (data.success) {
+                            if ((userAuth.username || '') !== username) {
+                                activePostsController?.abort();
+                                postsRequestGeneration++;
+                                isLoading = false;
+                                posts = [];
+                                imageGrid.replaceChildren();
+                                Object.keys(originalPostCache).forEach(key => delete originalPostCache[key]);
+                                temporaryTagEdits = {};
+                                seenPostIds.clear();
+                                offlineHistory = ''; offlineSearch = false; offlineFavoritesLoaded = false;
+                                userFavorites = [];
+                                selectionWidget.value = '{}';
+                                const response = await fetch('/danbooru_gallery/offline/status');
+                                if (response.ok) {
+                                    const state = await response.json();
+                                    offlineScope = state.scope || '';
+                                    offlineMode = state.mode; offlinePaused = state.paused;
+                                    if (offlineModeSelect) offlineModeSelect.value = offlineMode;
+                                }
+                            }
                             userAuth = {
                                 username,
                                 api_key,
@@ -622,6 +661,7 @@ app.registerExtension({
                 const loadFavorites = async (source = currentSource()) => {
                     const requestedSource = source;
                     try {
+                        if (requestedSource === 'danbooru' && usingLocal()) return;
                         const response = await fetch(`/danbooru_gallery/favorites?source=${encodeURIComponent(requestedSource)}`);
                         const data = await response.json();
                         // A rapid source switch can leave an older request in flight.
@@ -992,6 +1032,8 @@ app.registerExtension({
                     // trip, while the posts endpoint already reports failures.
                     networkStatus = { connected: true, lastChecked: Date.now(), lastError: null };
                     posts = [];
+                    imageGrid.replaceChildren();
+                    offlineHistory = ""; offlineSearch = false;
                     seenPostIds.clear();
                     lastPostId = null;
                     logger.info(`[sourceChange] 源切换为${uiSettings.source_site}, seenPostIds清空, lastPostId清空`);
@@ -2857,6 +2899,12 @@ app.registerExtension({
                         logger.warn(`[fetchAndRender] 跳过: endOfResults=true`);
                         return;
                     }
+                    const previousView = reset ? {
+                        posts, children: Array.from(imageGrid.children).filter(el => !el.classList.contains('danbooru-loading')),
+                        page: currentPage, visible: currentVisiblePage, windowStart: pageWindowStart,
+                        cursor: lastPostId, tags: currentTags, seen: new Set(seenPostIds), scroll: imageGrid.scrollTop,
+                    } : null;
+                    let viewCommitted = false;
                     const requestGeneration = ++postsRequestGeneration;
                     const requestController = new AbortController();
                     activePostsController = requestController;
@@ -2894,16 +2942,14 @@ app.registerExtension({
                         lastPostId = null;
                         seenPostIds.clear();
                         logger.info(`[fetchAndRender] reset完成: posts清空, endOfResults=置false, seenPostIds清空`);
-                        imageGrid.innerHTML = "";
-                        imageGrid.insertAdjacentHTML('beforeend', `<p class="danbooru-status danbooru-loading">${t('loading')}</p>`);
-                        imageGrid.scrollTop = 0;
+                        // Keep previous cards visible until the replacement response is available.
                         updatePaginationControls();
                     }
 
                     const requestPage = currentPage;
 
                     // 网络检查
-                    const isNetworkConnected = await checkNetworkStatus();
+                    const isNetworkConnected = (uiSettings.source_site || "danbooru") === "danbooru" ? true : await checkNetworkStatus();
                     if (requestGeneration !== postsRequestGeneration) return;
                     if (!isNetworkConnected) {
                         console.log("网络错误已隐藏: 网络连接失败 - 无法连接到Danbooru服务器，请检查网络连接");
@@ -2937,7 +2983,7 @@ app.registerExtension({
                         const _dedup = uiSettings.gelbooru_dedup_mode || "off";
                         if (_src === "gelbooru" && _dedup === "on" && tagCount > 1) {
                             showTagHint('开启去重时仅支持 1 个 tag（游标占用名额），其余 tag 将被忽略；如需多 tag 请配置密钥后选“开启·已配密钥”', false);
-                        } else if (tagCount > 2) {
+                        } else if (tagCount > 2 && _src === 'gelbooru') {
                             showTagHint('搜索只考虑前两个tag，第三个及后续tag将被忽略', false);
                         } else {
                             clearTagHint();
@@ -2961,7 +3007,7 @@ app.registerExtension({
                         // 游标分页：D站始终用游标；G站仅当 dedup 非 off 时。
                         // G站游标续拉必须回到 pid=0，否则从高页跳转后会叠加页偏移。
                         const useCursor = src === "danbooru" || (src === "gelbooru" && dedup !== "off");
-                        const hasCursor = useCursor && Boolean(lastPostId);
+                        const hasCursor = useCursor && !offlineSearch && !offlineHistory && Boolean(lastPostId);
                         const gelbooruCursorMode = src === "gelbooru" && dedup !== "off";
                         const apiPage = gelbooruCursorMode && hasCursor ? 1 : requestPage;
                         logger.info(`[fetchAndRender] API参数: src=${src} dedup=${dedup} logicalPage=${requestPage} apiPage=${apiPage} limit=${loadLimit} before_id=${lastPostId} reset=${reset}`);
@@ -2982,11 +3028,53 @@ app.registerExtension({
                             logger.info(`[fetchAndRender] 无游标: useCursor=${useCursor} lastPostId=${lastPostId}`);
                         }
 
-                        const response = await fetch(`/danbooru_gallery/posts?${params}`, {
+                        let endpoint = '/danbooru_gallery/posts';
+                        if (src === 'danbooru') {
+                            if (offlineHistory && searchInput.value !== offlineHistoryQuery) offlineHistory = "";
+                            if (offlineHistory) params.set('history', offlineHistory);
+                            if (offlineRetry) { params.set('retry', '1'); offlineRetry = false; }
+                            if (offlineSearch) {
+                                endpoint = '/danbooru_gallery/offline/search';
+                                params.delete('before_id');
+                            }
+                        }
+                        const response = await fetch(`${endpoint}?${params}`, {
                             signal: requestController.signal,
                         });
                         logger.info(`[fetchAndRender] 响应: status=${response.status}`);
                         const rawText = await response.text();
+                        if (requestGeneration !== postsRequestGeneration) return;
+                        if (src === 'danbooru') {
+                            const origin = response.headers.get('X-Gallery-Source');
+                            if (origin === 'history') {
+                                offlinePaused = true;
+                                if (!offlineHistory) { offlineHistory = response.headers.get('X-Gallery-History') || ''; offlineHistoryQuery = searchInput.value; }
+                            }
+                            if (response.headers.get('X-Gallery-Missing') === '1') {
+                                endOfResults = true;
+                                parseFailed = true;
+                                offlineNotice("此页尚未保存到本地。已保留当前内容；可打开历史记录或搜索本地图片。");
+                                return;
+                            }
+                            if (!response.ok) {
+                                let detail;
+                                try { detail = JSON.parse(rawText).error; } catch {}
+                                throw new Error(detail || '离线请求失败');
+                            }
+                            if (origin === 'online') {
+                                offlinePaused = false;
+                                offlineNotice("在线浏览 · 已保存页面，缩略图正在后台补齐");
+                                if (!offlineFavoritesLoaded && hasFavoriteAuth()) {
+                                    offlineFavoritesLoaded = true;
+                                    void loadFavorites('danbooru');
+                                }
+                            } else if (origin === 'search') {
+                                offlineNotice("本地搜索结果 · 仅包含已缓存图片");
+                            } else if (origin === 'history') {
+                                const saved = Number(response.headers.get('X-Gallery-Saved'));
+                                offlineNotice(`正在浏览本地缓存 · 保存时间 ${saved ? new Date(saved * 1000).toLocaleString() : '未知'}`);
+                            }
+                        }
                         if (requestGeneration !== postsRequestGeneration) return;
 
                         // 防御性 JSON 解析：后端偶发返回非 JSON（错误页/半截响应），此时不销毁已有内容
@@ -3023,6 +3111,12 @@ app.registerExtension({
                             renderErrorCell(parseError, requestPage);
                             return;
                         }
+
+                        if (reset) {
+                            imageGrid.replaceChildren();
+                            imageGrid.scrollTop = 0;
+                        }
+                        viewCommitted = true;
 
                         // 先分离 error 占位格与正常 post
                         const errorPosts = newPosts.filter(p => p && p.error);
@@ -3114,6 +3208,12 @@ app.registerExtension({
                             return;
                         }
                         logger.error(`[fetchAndRender] 异常: ${e.message}`);
+                        if ((uiSettings.source_site || "danbooru") === "danbooru") {
+                            parseFailed = true;
+                            endOfResults = true;
+                            offlineNotice(e.message);
+                            return;
+                        }
                         // 首次加载→整屏错误；滚动续拉→保留内容+加错误格
                         const requestError = {
                                 error: `请求失败: ${e.message}`,
@@ -3135,6 +3235,18 @@ app.registerExtension({
                         }
                     } finally {
                         if (requestGeneration !== postsRequestGeneration) return;
+                        if (previousView && !viewCommitted) {
+                            posts = previousView.posts;
+                            currentPage = previousView.page;
+                            currentVisiblePage = previousView.visible;
+                            pageWindowStart = previousView.windowStart;
+                            lastPostId = previousView.cursor;
+                            currentTags = previousView.tags;
+                            seenPostIds.clear();
+                            previousView.seen.forEach(id => seenPostIds.add(id));
+                            imageGrid.replaceChildren(...previousView.children);
+                            imageGrid.scrollTop = previousView.scroll;
+                        }
                         isLoading = false;
                         if (activePostsController === requestController) activePostsController = null;
                         logger.info(`[fetchAndRender] finally: isLoading=置false endOfResults=${endOfResults} parseFailed=${parseFailed}`);
@@ -3154,6 +3266,7 @@ app.registerExtension({
                 };
 
                 const maybeLoadMore = () => {
+                    if (usingLocal()) return;
                     if (isLoading || endOfResults) {
                         logger.warn(`[maybeLoadMore] 跳过: isLoading=${isLoading} endOfResults=${endOfResults}`);
                         return;
@@ -3176,7 +3289,8 @@ app.registerExtension({
                 };
 
                 // 2 秒定时轮询检查前方缓冲，不够就自动补货
-                setInterval(() => {
+                this._galleryLoadTimer = setInterval(() => {
+                    if (!container.isConnected || usingLocal()) return;
                     logger.debug(`[setInterval] tick`);
                     maybeLoadMore();
                 }, 2000);
@@ -3187,13 +3301,17 @@ app.registerExtension({
                         const rowGap = parseInt(cs.getPropertyValue('grid-row-gap')) || parseInt(cs.rowGap) || 5;
                         const rowHeight = parseInt(cs.getPropertyValue('grid-auto-rows')) || 1;
 
+                        const updates = [];
                         Array.from(imageGrid.children).forEach((wrapper) => {
                             const img = wrapper.querySelector('img');
                             if ((img && img.clientHeight > 0) || wrapper.classList.contains('danbooru-error-wrapper')) {
                                 const spans = Math.ceil((wrapper.offsetHeight + rowGap) / (rowHeight + rowGap));
-                                wrapper.style.gridRowEnd = `span ${spans}`;
+                                updates.push([wrapper, `span ${spans}`]);
                             }
                         });
+                        for (const [wrapper, span] of updates) {
+                            if (wrapper.style.gridRowEnd !== span) wrapper.style.gridRowEnd = span;
+                        }
                     } catch (e) {
                         // 计算失败不影响主体流程
                     }
@@ -3235,10 +3353,8 @@ app.registerExtension({
                     });
                 };
 
-                // DOM 滑动窗口回收：保留最近 ~100 页(4200张)，超出后从最老端回收，
-                // "浏览多少回收多少"。posts 数组与 imageGrid 子节点同序一一对应，
-                // 必须同步缩短前缀，否则补货比例(maybeLoadMore)和选中查找(Queue)会错位。
-                const MAX_KEPT_ITEMS = 4200; // ~100 页 @ 42/页
+                // Recycle old unselected cards; disk history remains available for backward navigation.
+                const MAX_KEPT_ITEMS = 240; // Keep a bounded window of recent cards.
                 const recycleOldItems = () => {
                     try {
                         const children = imageGrid.children;
@@ -3258,18 +3374,20 @@ app.registerExtension({
                         }
 
                         let removed = 0;
-                        // 从最老端逐个回收，遇到视口锚点或选中项即停(保护视口内容与用户选择)
-                        while (removed < overflow) {
-                            const el = imageGrid.firstElementChild;
-                            if (!el || el === anchorEl) break;
-                            if (el.classList && el.classList.contains('selected')) break;
-                            imageGrid.removeChild(el);
+                        // Stop at the viewport anchor; skip selected cards without blocking recycling.
+                        for (const el of Array.from(children)) {
+                            if (removed >= overflow || el === anchorEl) break;
+                            if (!el.classList.contains('danbooru-image-wrapper') || el.classList.contains('selected')) continue;
+                            const index = posts.indexOf(el._galleryPost);
+                            if (index >= 0) posts.splice(index, 1);
+                            delete originalPostCache[el.dataset.postId];
+                            delete temporaryTagEdits[el.dataset.postId];
+                            gelbooruPrefetchObserver?.unobserve(el);
+                            el.remove();
                             removed++;
                         }
                         if (removed <= 0) return;
 
-                        // 同步缩短 posts 前缀，保持与 DOM 对齐
-                        posts.splice(0, removed);
 
                         // 补偿滚动位置：回收后用锚点重新定位，避免视口跳动
                         if (anchorEl && anchorEl.isConnected) {
@@ -3355,7 +3473,7 @@ app.registerExtension({
                         const originalPost = originalPostCache[post.id];
 
                         // 检查是否有实际编辑
-                        let hasActualEdits = false;
+                        let hasActualEdits = Boolean(postDataToRender?.disabled_prompt_tags?.length);
                         if (postDataToRender && originalPost) {
                             const categories = ["artist", "copyright", "character", "general", "meta"];
                             for (const category of categories) {
@@ -3552,6 +3670,10 @@ app.registerExtension({
 
                 const renderTagsInPanel = async (tagsContainer, postData, panel) => {
                     tagsContainer.innerHTML = ''; // Clear existing tags
+                    let paintEnabled = null;
+                    const paintedTags = new Set();
+                    tagsContainer.onpointerleave = () => { paintEnabled = null; };
+                    tagsContainer.onpointerup = tagsContainer.onpointercancel = () => { paintEnabled = null; };
 
                     const createClickableTagSpan = (tag, category, translation = null) => {
                         const span = $el("span", {
@@ -3565,8 +3687,51 @@ app.registerExtension({
                             document.querySelectorAll('.danbooru-tag-context-menu').forEach(menu => menu.remove());
                         };
 
-                        span.addEventListener('click', (e) => {
+                        const isEnabled = () => !(postData.disabled_prompt_tags || []).includes(tag);
+                        const refreshToggle = () => {
+                            span.classList.toggle('danbooru-tag-disabled', !isEnabled());
+                            span.setAttribute('aria-pressed', String(isEnabled()));
+                        };
+                        const setEnabled = (enabled) => {
+                            const disabled = new Set(postData.disabled_prompt_tags || []);
+                            if (enabled) disabled.delete(tag); else disabled.add(tag);
+                            postData.disabled_prompt_tags = [...disabled];
+                            temporaryTagEdits[postData.id] = postData;
+                            refreshToggle();
+                            updateSelectionData();
+                            const wrapper = imageGrid.querySelector(`.danbooru-image-wrapper[data-post-id="${postData.id}"]`);
+                            if (wrapper) updateEditedStatus(wrapper, postData.id);
+                        };
+                        span.tabIndex = 0;
+                        span.setAttribute('role', 'button');
+                        refreshToggle();
+                        span.addEventListener('pointerdown', (e) => {
+                            if (e.button !== 0) return;
+                            e.preventDefault();
                             e.stopPropagation();
+                            removeExistingMenus();
+                            paintEnabled = !isEnabled();
+                            paintedTags.clear();
+                            paintedTags.add(tag);
+                            setEnabled(paintEnabled);
+                        });
+                        span.addEventListener('pointerenter', (e) => {
+                            if (!(e.buttons & 1)) { paintEnabled = null; return; }
+                            if (paintEnabled === null || paintedTags.has(tag)) return;
+                            paintedTags.add(tag);
+                            setEnabled(paintEnabled);
+                        });
+                        span.addEventListener('click', (e) => e.stopPropagation());
+                        span.addEventListener('keydown', (e) => {
+                            if (e.key !== ' ' && e.key !== 'Enter') return;
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setEnabled(!isEnabled());
+                        });
+                        span.addEventListener('contextmenu', (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            paintEnabled = null;
                             removeExistingMenus();
 
                             const menu = $el("div.danbooru-tag-context-menu", {
@@ -3825,7 +3990,7 @@ app.registerExtension({
                     const filterTagSet = getFilterTagSet();
 
                     const orderedFilteredTags = categoriesToUse.flatMap(category => categorizedPromptTags[category] || [])
-                        .filter(tag => shouldKeepPromptTag(tag, filterTagSet));
+                        .filter(tag => !(promptPost.disabled_prompt_tags || []).includes(tag) && shouldKeepPromptTag(tag, filterTagSet));
 
                     return orderedFilteredTags.map(formatPromptTag).filter(Boolean).join(', ');
                 };
@@ -3877,6 +4042,7 @@ app.registerExtension({
 
                 const prepareSelectionForQueue = async () => {
                     try {
+                        if (usingLocal()) throw new Error('离线未缓存原图，无法输出图像；可以编辑、复制提示词，或手动重试联网。');
                         const selectedWrappers = imageGrid.querySelectorAll('.danbooru-image-wrapper.selected');
                         if (selectedWrappers.length === 0) {
                             let savedSelectionData = {};
@@ -3926,6 +4092,7 @@ app.registerExtension({
                             selectionWidget.value = JSON.stringify({
                                 selections: savedSelections,
                                 nodeId: nodeInstanceId,
+                                _offline_scope: (uiSettings.source_site || 'danbooru') === 'danbooru' ? offlineScope : '',
                                 _queue_id: selectionQueueId,
                             });
                             selectionWidget.callback();
@@ -3971,6 +4138,7 @@ app.registerExtension({
                         const selectionData = {
                             selections,
                             nodeId: nodeInstanceId,
+                                _offline_scope: (uiSettings.source_site || 'danbooru') === 'danbooru' ? offlineScope : '',
                             _queue_id: selectionQueueId,
                         };
                         selectionWidget.value = JSON.stringify(selectionData);
@@ -4019,6 +4187,7 @@ app.registerExtension({
                         const wrapper = $el("div.danbooru-image-wrapper", {
                             style: { border: '1px solid #ff6b6b', minHeight: '180px', display: 'flex', alignItems: 'stretch', justifyContent: 'stretch', color: '#ff6b6b', fontSize: '0.85em', padding: '8px', textAlign: 'left', background: 'var(--comfy-input-bg)', gridRowEnd: `span ${Math.ceil((198 + rowGap) / (rowHeight + rowGap))}` }
                         });
+                        wrapper._galleryPost = post;
                         wrapper.classList.add("danbooru-error-wrapper");
                         wrapper.dataset.postId = `err_${post.pid || post.page || '?'}`;
                         wrapper.dataset.errorCount = String(post.error_count || 1);
@@ -4031,9 +4200,10 @@ app.registerExtension({
                         return wrapper;
                     }
 
-                    if (!post.id || !post.preview_file_url) return null;
+                    if (!post.id || (post.source_site === 'gelbooru' && !post.preview_file_url)) return null;
 
                     const wrapper = $el("div.danbooru-image-wrapper");
+                    wrapper._galleryPost = post;
                     wrapper.dataset.postId = post.id; // 显式设置 data-post-id
                     if (resolvedGalleryPage) wrapper.dataset.galleryPage = String(resolvedGalleryPage);
 
@@ -4064,10 +4234,25 @@ app.registerExtension({
                         ? post.preview_file_url
                         : `${post.preview_file_url}?v=${post.md5}`;
 
+                    const thumbnailUrl = post.source_site === 'gelbooru'
+                        ? `/danbooru_gallery/image_proxy?thumbnail=1&url=${encodeURIComponent(previewUrl)}`
+                        : `/danbooru_gallery/offline/thumbnail?url=${encodeURIComponent(post.preview_file_url)}`;
                     const img = $el("img", {
-                        src: `/danbooru_gallery/image_proxy?url=${encodeURIComponent(previewUrl)}`,
+                        src: thumbnailUrl,
+                        loading: "lazy",
+                        decoding: "async",
                         onload: scheduleResizeGrid,
                         onerror: (evt) => {
+                            if (post.source_site !== 'gelbooru') {
+                                img.onerror = null;
+                                img.removeAttribute('src');
+                                img.alt = '缩略图尚未缓存（标签仍可使用）';
+                                img.style.aspectRatio = `${post.image_width || 1} / ${post.image_height || 1}`;
+                                img.style.background = 'var(--comfy-input-bg)';
+                                img.title = '联网后点击刷新补齐缩略图';
+                                scheduleResizeGrid();
+                                return;
+                            }
                             // 重试一次，仍失败则显示错误+刷新按钮
                             if (!evt.target.dataset.retried) {
                                 evt.target.dataset.retried = '1';
@@ -4080,7 +4265,9 @@ app.registerExtension({
                             </div>`;
                             wrapper.querySelector('button').onclick = () => {
                                 const fresh = document.createElement('img');
-                                fresh.src = `/danbooru_gallery/image_proxy?url=${encodeURIComponent(previewUrl)}`;
+                                fresh.src = `/danbooru_gallery/image_proxy?thumbnail=1&url=${encodeURIComponent(previewUrl)}`;
+                                fresh.loading = "lazy";
+                                fresh.decoding = "async";
                                 fresh.onload = scheduleResizeGrid;
                                 fresh.onerror = () => { wrapper.style.display = 'none'; };
                                 wrapper.innerHTML = '';
@@ -4159,7 +4346,8 @@ app.registerExtension({
                         </svg>`,
                         title: t('download'),
                         onclick: async (e) => {
-                            e.stopPropagation(); // 阻止事件冒泡，避免触发图片选择
+                            e.stopPropagation();
+                            if (!requireOnlineMedia(post)) return; // 阻止事件冒泡，避免触发图片选择
 
                             try {
                                 const hydratedPost = await hydrateGelbooruPost(post, {
@@ -4373,7 +4561,8 @@ app.registerExtension({
                         title: isFavorited ? t('unfavorite') : t('favorite'),
                         className: isFavorited ? 'favorited' : '',
                         onclick: async (e) => {
-                            e.stopPropagation(); // 阻止事件冒泡，避免触发图片选择
+                            e.stopPropagation();
+                            if (!requireOnlineMedia(post)) return; // 阻止事件冒泡，避免触发图片选择
 
                             // 如果用户未登录，提示登录
                             if (!hasFavoriteAuth()) {
@@ -4438,6 +4627,7 @@ app.registerExtension({
                         title: t('viewImage'),
                         onclick: async (e) => {
                             e.stopPropagation();
+                            if (!requireOnlineMedia(post)) return;
                             const hydratedPost = await hydrateGelbooruPost(post, {
                                 requireTags: false,
                                 requireMedia: true,
@@ -4561,6 +4751,7 @@ app.registerExtension({
                     }
                 });
                 ratingSelect.addEventListener("change", () => {
+                    offlineHistory = '';
                     if (globalTooltip) {
                         globalTooltip.style.display = 'none';
                     }
@@ -4744,6 +4935,115 @@ app.registerExtension({
                 });
 
                 // 将包含搜索框和建议面板的容器添加到总控件中
+                const offlineBar = $el("div.danbooru-offline-controls", {
+                    style: { display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center', padding: '4px 0' },
+                });
+                offlineMessage = $el('span', { textContent: '在线浏览 · 历史数据与缩略图保存在本地',
+                    style: { flex: '1 1 100%', fontSize: '12px', color: 'var(--comfy-input-text)' } });
+                const offlineRequest = async (url, payload) => {
+                    const response = await fetch('/danbooru_gallery/offline/' + url, payload === undefined ? {} : {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+                    });
+                    if (!response.ok) throw new Error(await response.text());
+                    return response.json();
+                };
+                const offlineAction = (label, callback) => $el('button', {
+                    type: 'button', textContent: label,
+                    onclick: async (event) => {
+                        event.stopPropagation();
+                        const button = event.currentTarget;
+                        button.disabled = true;
+                        try { await callback(); } catch (error) { offlineNotice(error.message); }
+                        finally { button.disabled = false; }
+                    },
+                });
+                offlineModeSelect = $el('select', { title: 'D站连接模式',
+                    onchange: async () => {
+                        try {
+                            activePostsController?.abort();
+                            const state = await offlineRequest('mode', { mode: offlineModeSelect.value });
+                            offlineMode = state.mode;
+                            offlinePaused = offlineMode === 'local';
+                            offlineHistory = '';
+                            offlineSearch = false;
+                            offlineRetry = offlineMode === 'auto';
+                            await fetchAndRender(true);
+                        } catch (error) { offlineModeSelect.value = offlineMode; offlineNotice(error.message); }
+                    },
+                }, [$el('option', { value: 'auto', textContent: '自动联网' }), $el('option', { value: 'local', textContent: '仅本地' })]);
+                const openOfflineDialog = async (historyView) => {
+                    const dialog = $el('dialog', { style: { width: 'min(680px, 85vw)', maxHeight: '80vh', overflow: 'auto',
+                        background: 'var(--comfy-menu-bg)', color: 'var(--comfy-input-text)', border: '1px solid #666', borderRadius: '8px' } });
+                    dialog.appendChild($el('h3', { textContent: historyView ? 'D站历史记录' : 'D站离线缓存' }));
+                    const content = $el('div');
+                    dialog.appendChild(content);
+                    const close = () => { dialog.close(); dialog.remove(); };
+                    dialog.addEventListener('cancel', (event) => { event.preventDefault(); close(); });
+                    dialog.appendChild(offlineAction('关闭', close));
+                    document.body.appendChild(dialog);
+                    dialog.showModal();
+                    let offset = 0;
+                    const refresh = async () => {
+                        content.replaceChildren();
+                        if (historyView) {
+                            const { items } = await offlineRequest('history?offset=' + offset);
+                            if (!items.length) content.appendChild($el('p', { textContent: '尚无已保存的历史页面。' }));
+                            for (const item of items) {
+                                const row = $el('div', { style: { padding: '10px 0', borderBottom: '1px solid #555' } });
+                                row.appendChild($el('div', { textContent: `${item.spec.tags || '全部图片'} · 评分 ${item.spec.rating || '全部'} · ${item.pages} 页 · ${new Date(item.saved * 1000).toLocaleString()}` }));
+                                row.appendChild(offlineAction('恢复页面', async () => {
+                                    offlineHistory = item.id;
+                                    offlineSearch = false;
+                                    searchInput.value = item.spec.tags.split(/\s+/).filter(Boolean).join(', ');
+                                    offlineHistoryQuery = searchInput.value;
+                                    applySelectedRatings(item.spec.rating ? item.spec.rating.split(',') : RATING_VALUES);
+                                    filterState.startTime = null;
+                                    filterState.endTime = null;
+                                    offlinePaused = true;
+                                    close();
+                                    await fetchAndRender(true, item.first_page);
+                                }));
+                                row.appendChild(offlineAction('删除此历史', async () => {
+                                    const impact = await offlineRequest('status?history=' + encodeURIComponent(item.id));
+                                    if (!window.confirm(`删除这条历史记录？包含 ${impact.posts} 张图片，其中 ${impact.exclusive_posts} 张仅被此记录引用，将一并清理。`)) return;
+                                    await offlineRequest('delete', { history: item.id, confirmed: true });
+                                    await refresh();
+                                }));
+                                content.appendChild(row);
+                            }
+                            if (offset > 0) content.appendChild(offlineAction('上一批', async () => { offset -= 50; await refresh(); }));
+                            if (items.length === 50) content.appendChild(offlineAction('下一批', async () => { offset += 50; await refresh(); }));
+                        } else {
+                            const state = await offlineRequest('status');
+                            content.appendChild($el('p', { textContent: `帖子 ${state.posts} · 可离线浏览 ${state.ready} · 待补齐 ${state.pending} · 历史记录 ${state.histories}` }));
+                            content.appendChild($el('p', { textContent: `磁盘占用 ${(state.disk_bytes / 1024 / 1024).toFixed(1)} MB。长期保留，不自动清理。` }));
+                            content.appendChild(offlineAction('刷新统计', refresh));
+                            content.appendChild(offlineAction('清空离线数据', async () => {
+                                if (!window.confirm(`清空当前账号的 ${state.histories} 条历史和 ${state.posts} 张图片的离线缓存？此操作无法撤销。`)) return;
+                                await offlineRequest('delete', { confirmed: true });
+                                offlineHistory = '';
+                                await refresh();
+                            }));
+                        }
+                    };
+                    try { await refresh(); } catch (error) { content.textContent = error.message; }
+                };
+                offlineBar.append(offlineModeSelect,
+                    offlineAction('历史记录', () => openOfflineDialog(true)),
+                    offlineAction('搜索本地已缓存图片', async () => {
+                        offlineSearch = true; offlineHistory = ''; offlinePaused = true;
+                        await fetchAndRender(true, 1);
+                    }),
+                    offlineAction('离线缓存管理', () => openOfflineDialog(false)),
+                    offlineAction('重试联网', async () => {
+                        await offlineRequest('mode', { mode: 'auto' });
+                        offlineMode = 'auto'; offlineModeSelect.value = 'auto';
+                        offlinePaused = false; offlineSearch = false; offlineHistory = ''; offlineRetry = true;
+                        await fetchAndRender(true, currentVisiblePage);
+                    }), offlineMessage);
+                const updateOfflineVisibility = () => { offlineBar.style.display = sourceSelect.value === 'gelbooru' ? 'none' : 'flex'; };
+                sourceSelect.addEventListener('change', updateOfflineVisibility);
+                container.appendChild(offlineBar);
                 container.appendChild($el("div.danbooru-controls", [searchContainer, sourceSelect, displayAllSiteContentToggle, rankingButton, favoritesButton, ratingSelect, categoryDropdown, formattingDropdown, filterButton, clearSelectionButton, settingsButton, refreshButton]));
 
                 // 🔧 重要：在 searchInput 被添加到 DOM 之后才创建智能补全实例
@@ -4850,7 +5150,7 @@ app.registerExtension({
                     const originalPost = originalPostCache[postId]; // 从缓存中获取原始数据
                     const editedPost = temporaryTagEdits[postId];
 
-                    let isTrulyEdited = false;
+                    let isTrulyEdited = Boolean(editedPost?.disabled_prompt_tags?.length);
                     if (editedPost && originalPost) {
                         const categories = ["artist", "copyright", "character", "general", "meta"];
                         const hasCategoryTags = categories.some(cat => originalPost.hasOwnProperty(`tag_string_${cat}`) || editedPost.hasOwnProperty(`tag_string_${cat}`));
@@ -4902,28 +5202,17 @@ app.registerExtension({
 
                         await loadUiSettings();
 
-                        // 优先检测网络连接状态
-                        try {
-                            const sourceForNetworkCheck = loadFromLocalStorage('sourceSite', uiSettings.source_site || "danbooru");
-                            const networkResponse = await fetch(`/danbooru_gallery/check_network?source=${encodeURIComponent(sourceForNetworkCheck)}`);
-                            const networkData = await networkResponse.json();
-                            networkStatus = {
-                                connected: Boolean(networkData.success && networkData.connected),
-                                lastChecked: Date.now(),
-                                lastError: networkData.success && networkData.connected ? null : networkData,
-                            };
-                            if (!networkData.success || !networkData.connected) {
-                                networkConnected = false;
-                                // 注释掉网络错误toast提示 - 本小姐才不想看到这些烦人的提示呢！
-                                // showError('网络连接失败 - 无法连接到Danbooru服务器，请检查网络连接', true);
-                                console.log("网络错误已隐藏: 网络连接失败 - 无法连接到Danbooru服务器，请检查网络连接");  // 仅在控制台记录
-                            }
-                        } catch (e) {
-                            logger.error('网络检测失败:', e);
-                            networkConnected = false;
-                            // 注释掉网络错误toast提示 - 本小姐才不想看到这些烦人的提示呢！
-                            // showError('网络检测失败 - 请检查网络连接', true);
-                            console.log("网络错误已隐藏: 网络检测失败 - 请检查网络连接");  // 仅在控制台记录
+                        const offlineStatusResponse = await fetch('/danbooru_gallery/offline/status');
+                        if (offlineStatusResponse.ok) {
+                            const state = await offlineStatusResponse.json();
+                            offlineScope = state.scope || '';
+                            offlineMode = state.mode;
+                            offlinePaused = state.paused;
+                            if (offlineModeSelect) offlineModeSelect.value = offlineMode;
+                            if (usingLocal()) offlineNotice("仅浏览本地已缓存内容；可打开历史记录或本地搜索。");
+                        }
+                        if ((uiSettings.source_site || "danbooru") === "gelbooru") {
+                            networkConnected = await checkNetworkStatus();
                         }
 
                         // 加载语言设置
@@ -4933,7 +5222,7 @@ app.registerExtension({
                         await loadUserAuth();
 
 
-                        if (networkConnected && hasFavoriteAuth()) {
+                        if (networkConnected && (uiSettings.source_site || "danbooru") === "gelbooru" && hasFavoriteAuth()) {
                             await loadFavorites();
                         }
 
@@ -5043,6 +5332,7 @@ app.registerExtension({
                             filterButton.classList.remove('active');
                         }
 
+                        updateOfflineVisibility();
                         // 页面加载时直接获取第一页的帖子（先同步 currentTags，否则重置块会因 '' !== 搜索值而清空锚点）
                         currentTags = searchInput.value.trim();
                         logger.info(`[init] 开始首次加载: src=${uiSettings.source_site || "danbooru"} dedup=${uiSettings.gelbooru_dedup_mode || "off"} preload=${uiSettings.preload_count || 40} tags="${currentTags}"`);
@@ -5127,6 +5417,7 @@ app.registerExtension({
 
             const onRemoved = nodeType.prototype.onRemoved;
             nodeType.prototype.onRemoved = function () {
+                clearInterval(this._galleryLoadTimer);
                 galleryQueuePreparers.delete(this);
                 // 移除所有可能由该节点创建的全局UI元素
                 const elementsToRemove = document.querySelectorAll(
@@ -5424,7 +5715,7 @@ $el("style", {
     .danbooru-controls > .danbooru-search-container > .danbooru-search-input { background: var(--comfy-input-bg); border: 1px solid var(--input-border-color); padding: 5px 10px; border-radius: 4px; }
     .danbooru-controls .danbooru-search-input { flex-grow: 1; min-width: 150px; }
     .danbooru-controls > select { min-width: 100px; }
-    .danbooru-source-select { height: 32px; padding: 5px 8px; border-radius: 4px; border: 1px solid var(--input-border-color); background-color: var(--comfy-input-bg); color: var(--comfy-input-text); }
+    .danbooru-controls > .danbooru-source-select { height: auto; min-height: 40px; align-self: stretch; box-sizing: border-box; padding: 5px 8px; border-radius: 4px; border: 1px solid var(--input-border-color); background-color: var(--comfy-input-bg); color: var(--comfy-input-text); }
     .danbooru-gelbooru-display-all-toggle { height: 32px; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 4px; border: 1px solid var(--input-border-color); background-color: var(--comfy-input-bg); color: var(--comfy-input-text); font-size: 12px; white-space: nowrap; cursor: pointer; }
     .danbooru-gelbooru-display-all-toggle input { margin: 0; }
     .danbooru-image-wrapper.new-item { animation: fadeInUp 0.5s ease-out; }
@@ -5587,9 +5878,16 @@ $el("style", {
 
     .danbooru-copy-prompt-button {
         position: absolute !important;
+        width: 28px !important;
+        height: 28px !important;
         right: 8px;
         bottom: 8px;
         z-index: 15;
+    }
+
+    .danbooru-copy-prompt-button svg {
+        width: 16px;
+        height: 16px;
     }
 
     .danbooru-copy-prompt-button:focus-visible {
@@ -5621,12 +5919,17 @@ $el("style", {
     }
 
     /* 可点击的tag样式 */
+    .danbooru-tag-disabled {
+        opacity: 0.35;
+        text-decoration: line-through;
+    }
     .danbooru-clickable-tag {
+        user-select: none;
         cursor: pointer !important;
-        transition: transform 0.1s, filter 0.1s !important;
+        transition: filter 0.1s !important;
     }
     .danbooru-clickable-tag:hover {
-        transform: scale(1.05) !important;
+        transform: none !important;
         filter: brightness(1.2) !important;
     }
 
@@ -6170,6 +6473,9 @@ $el("style", {
         transform: translateY(0);
     }
     .danbooru-edit-tags-container {
+        min-height: 0;
+        overflow-x: hidden;
+        scrollbar-gutter: stable;
         scrollbar-width: thin;
         scrollbar-color: #555 #333;
     }
@@ -6229,6 +6535,7 @@ $el("style", {
         transition: all 0.2s;
     }
     .danbooru-add-tag-button:hover {
+        transform: none;
         background-color: rgba(123, 104, 238, 0.3);
         color: white;
         border-style: solid;
