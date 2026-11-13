@@ -1,291 +1,118 @@
-"""
-Translation data loader
-Loads and integrates translation data from multiple sources
-"""
-
-import json
-import csv
+"""Independent ffdkj SQLite dictionary used by gallery translations."""
+from contextlib import closing
 from pathlib import Path
-from typing import Dict, Optional, List, Set
+import re
+import sqlite3
+import unicodedata
 
-# Logger导入
-from ...utils.logger import get_logger
-logger = get_logger(__name__)
+SOURCE_URL = "https://raw.githubusercontent.com/ffdkj/ffdkj-Danbooru_Tag-Chinese-English-Translation-Table/main/tag.sqlite"
+DEFAULT_DICTIONARY = Path(__file__).resolve().parents[1] / "data" / "tag.sqlite"
+
+
+def normalize_tag(tag):
+    text = unicodedata.normalize("NFKC", tag).strip().casefold()
+    return re.sub(r"\\([()\[\]{}])", r"\1", text).replace(" ", "_")
+
+
+def validate_dictionary(path):
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise ValueError("SQLite integrity check failed")
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(tags)")}
+        for name, kind in {"name": "TEXT", "cn_name": "TEXT", "category": "INTEGER", "post_count": "INTEGER"}.items():
+            if name not in columns or columns[name][2].upper() != kind:
+                raise ValueError(f"Invalid tags.{name} column")
+        if not columns["name"][5]:
+            raise ValueError("tags.name must be the primary key")
+        count, invalid = conn.execute("""SELECT COUNT(*), SUM(
+            name IS NULL OR typeof(name) != 'text' OR trim(name) = ''
+            OR cn_name IS NULL OR typeof(cn_name) != 'text' OR trim(cn_name) = ''
+            OR category IS NULL OR category NOT IN (0,1,3,4,5)
+            OR post_count IS NULL OR typeof(post_count) != 'integer' OR post_count < 10)
+            FROM tags""").fetchone()
+        if not count or invalid:
+            raise ValueError("Dictionary has no tags or contains invalid rows")
+        return count
 
 
 class TranslationLoader:
-    """Load and manage translation data"""
-
-    def __init__(self, zh_cn_dir: Optional[str] = None):
-        """
-        Initialize translation loader
-
-        Args:
-            zh_cn_dir: Path to zh_cn directory (auto-detect if None)
-        """
-        if zh_cn_dir is None:
-            # Auto-detect zh_cn directory
-            # From py/global/translation to py/ then to danbooru_gallery/zh_cn
-            current_dir = Path(__file__).parent  # py/global/translation
-            py_dir = current_dir.parent.parent   # py/
-            zh_cn_dir = py_dir / "danbooru_gallery" / "zh_cn"
-
-        self.zh_cn_dir = Path(zh_cn_dir)
-
-        # Translation mappings
-        self.en_to_cn: Dict[str, str] = {}  # English -> Chinese
-        self.cn_to_en: Dict[str, str] = {}  # Chinese -> English
-
-        # Loaded flag
-        self._loaded = False
-
-    def _normalize_tag(self, tag: str) -> str:
-        """Normalize tag name (lowercase, strip)"""
-        return tag.lower().strip()
-
-    def _load_json_translations(self):
-        """Load translations from all_tags_cn.json"""
-        json_file = self.zh_cn_dir / "all_tags_cn.json"
-
-        if not json_file.exists():
-            logger.warning(f"⚠️ File not found: {json_file}")
-            return
-
-        try:
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            for en_tag, cn_trans in data.items():
-                en_tag_norm = self._normalize_tag(en_tag)
-                cn_trans_norm = cn_trans.strip()
-
-                self.en_to_cn[en_tag_norm] = cn_trans_norm
-                # Also add reverse mapping
-                if cn_trans_norm:
-                    self.cn_to_en[cn_trans_norm] = en_tag_norm
-
-            logger.info(f"✓ Loaded {len(data)} translations from JSON")
-
-        except Exception as e:
-            logger.error(f"❌ Error loading JSON: {e}")
-
-    def _load_csv_translations(self, csv_file: Path, reverse: bool = False):
-        """
-        Load translations from CSV file
-
-        Args:
-            csv_file: Path to CSV file
-            reverse: If True, first column is CN, second is EN
-        """
-        if not csv_file.exists():
-            logger.warning(f"⚠️ File not found: {csv_file}")
-            return
-
-        try:
-            count = 0
-            with open(csv_file, 'r', encoding='utf-8-sig') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if len(row) < 2:
-                        continue
-
-                    if reverse:
-                        # Chinese, English
-                        cn_trans = row[0].strip()
-                        en_tag = self._normalize_tag(row[1])
-                    else:
-                        # English, Chinese
-                        en_tag = self._normalize_tag(row[0])
-                        cn_trans = row[1].strip()
-
-                    if en_tag and cn_trans:
-                        # Don't overwrite existing translations
-                        if en_tag not in self.en_to_cn:
-                            self.en_to_cn[en_tag] = cn_trans
-                        if cn_trans not in self.cn_to_en:
-                            self.cn_to_en[cn_trans] = en_tag
-                        count += 1
-
-            logger.info(f"✓ Loaded {count} translations from {csv_file.name}")
-
-        except Exception as e:
-            logger.error(f"❌ Error loading CSV {csv_file.name}: {e}")
+    def __init__(self, dictionary_path=None):
+        self.dictionary_path = Path(dictionary_path or DEFAULT_DICTIONARY)
 
     def load_all(self):
-        """Load all translation files"""
-        if self._loaded:
-            return
+        return self.dictionary_path.is_file()
 
-        logger.info(f"📚 Loading translation data from {self.zh_cn_dir}...")
+    def _connect(self):
+        return sqlite3.connect(self.dictionary_path.resolve().as_uri() + "?mode=ro", uri=True)
 
-        # Load in priority order (later sources don't overwrite earlier ones)
-        self._load_json_translations()
-        self._load_csv_translations(self.zh_cn_dir / "danbooru.csv", reverse=False)
-        self._load_csv_translations(self.zh_cn_dir / "wai_characters.csv", reverse=True)
+    def translate_tags_batch(self, tags):
+        tags = list(tags)
+        if not tags or not self.load_all():
+            return {}
+        keys = list(dict.fromkeys(normalize_tag(tag) for tag in tags))
+        translations = {}
+        with closing(self._connect()) as conn:
+            for offset in range(0, len(keys), 500):
+                batch = keys[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                translations.update(conn.execute(
+                    f"SELECT name, cn_name FROM tags WHERE name IN ({placeholders})", batch))
+        return {tag: translations[normalize_tag(tag)] for tag in tags if normalize_tag(tag) in translations}
 
-        self._loaded = True
-        logger.info(f"✅ Total: {len(self.en_to_cn)} EN->CN, {len(self.cn_to_en)} CN->EN")
+    def get_chinese(self, tag):
+        return self.translate_tags_batch([tag]).get(tag)
 
-    def get_chinese(self, english_tag: str) -> Optional[str]:
-        """
-        Get Chinese translation for English tag
+    translate_tag = get_chinese
+    load_translation_data = load_all
 
-        Args:
-            english_tag: English tag name
+    def search_records(self, query, limit=50, min_post_count=100):
+        if not query.strip() or not self.load_all():
+            return []
+        with closing(self._connect()) as conn:
+            rows = conn.execute("""SELECT name, cn_name, category, post_count,
+                CASE WHEN cn_name = ? THEN 10 WHEN instr(cn_name, ?) = 1 THEN 8 ELSE 4 END AS score
+                FROM tags WHERE post_count >= ? AND instr(cn_name, ?) > 0
+                ORDER BY score DESC, post_count DESC, name LIMIT ?""",
+                (query.strip(), query.strip(), min_post_count, query.strip(), max(1, min(int(limit), 100)))).fetchall()
+        return [dict(tag=r[0], translation_cn=r[1], category=r[2], post_count=r[3], match_score=r[4]) for r in rows]
 
-        Returns:
-            Chinese translation or None
-        """
-        if not self._loaded:
-            self.load_all()
+    def search_english(self, query, limit=20, min_post_count=100):
+        if not query.strip() or not self.load_all():
+            return []
+        key = normalize_tag(query)
+        with closing(self._connect()) as conn:
+            rows = conn.execute("""SELECT name, cn_name, category, post_count
+                FROM tags WHERE post_count >= ? AND substr(name, 1, length(?)) = ?
+                ORDER BY (name = ?) DESC, post_count DESC, name LIMIT ?""",
+                (min_post_count, key, key, key, max(1, min(int(limit), 100)))).fetchall()
+        return [dict(name=r[0], translation=r[1], category=r[2], post_count=r[3], aliases=[]) for r in rows]
 
-        tag_norm = self._normalize_tag(english_tag)
+    def search_chinese(self, query, limit=50):
+        return [(r["tag"], r["translation_cn"]) for r in self.search_records(query, limit)]
 
-        # Try exact match
-        if tag_norm in self.en_to_cn:
-            return self.en_to_cn[tag_norm]
+    def search_chinese_tags(self, query, limit=10, min_post_count=100):
+        return self.search_records(query, limit, min_post_count)
 
-        # Try with underscores replaced with spaces
-        tag_space = tag_norm.replace('_', ' ')
-        if tag_space in self.en_to_cn:
-            return self.en_to_cn[tag_space]
+    def get_english(self, text):
+        records = self.search_records(text, 1, 10)
+        return records[0]["tag"] if records and records[0]["translation_cn"] == text.strip() else None
 
-        # Try with spaces replaced with underscores
-        tag_under = tag_norm.replace(' ', '_')
-        if tag_under in self.en_to_cn:
-            return self.en_to_cn[tag_under]
-
-        return None
-
-    def get_english(self, chinese_text: str) -> Optional[str]:
-        """
-        Get English tag for Chinese text
-
-        Args:
-            chinese_text: Chinese text
-
-        Returns:
-            English tag or None
-        """
-        if not self._loaded:
-            self.load_all()
-
-        text_norm = chinese_text.strip()
-
-        return self.cn_to_en.get(text_norm)
-
-    def search_chinese(self, query: str, limit: int = 50) -> List[tuple[str, str]]:
-        """
-        Search Chinese translations by query
-
-        Args:
-            query: Search query (Chinese)
-            limit: Maximum results
-
-        Returns:
-            List of (english_tag, chinese_translation) tuples
-        """
-        if not self._loaded:
-            self.load_all()
-
-        query_norm = query.strip().lower()
-        results = []
-
-        for cn_text, en_tag in self.cn_to_en.items():
-            cn_lower = cn_text.lower()
-
-            # Exact match
-            if cn_lower == query_norm:
-                results.append((en_tag, cn_text, 10))
-            # Starts with
-            elif cn_lower.startswith(query_norm):
-                results.append((en_tag, cn_text, 8))
-            # Contains
-            elif query_norm in cn_lower:
-                results.append((en_tag, cn_text, 4))
-
-        # Sort by score descending
-        results.sort(key=lambda x: x[2], reverse=True)
-
-        # Return without score
-        return [(en, cn) for en, cn, _ in results[:limit]]
-
-    def add_translations_to_tags(self, tags: List[Dict]) -> List[Dict]:
-        """
-        Add Chinese translations to tag dictionaries
-
-        Args:
-            tags: List of tag dictionaries with 'tag' field
-
-        Returns:
-            List of tag dictionaries with 'translation_cn' field added
-        """
-        if not self._loaded:
-            self.load_all()
-
-        for tag_info in tags:
-            tag_name = tag_info.get('tag', '')
-            if tag_name:
-                translation = self.get_chinese(tag_name)
-                tag_info['translation_cn'] = translation
-
+    def add_translations_to_tags(self, tags):
+        translations = self.translate_tags_batch(t.get("tag", "") for t in tags)
+        for tag in tags:
+            tag["translation_cn"] = translations.get(tag.get("tag", ""))
         return tags
 
-    def get_stats(self) -> Dict:
-        """Get translation statistics"""
-        if not self._loaded:
-            self.load_all()
-
-        return {
-            'en_to_cn_count': len(self.en_to_cn),
-            'cn_to_en_count': len(self.cn_to_en),
-            'loaded': self._loaded
-        }
+    def get_stats(self):
+        if not self.load_all():
+            return {"loaded": False, "en_to_cn_count": 0, "cn_to_en_count": 0}
+        with closing(self._connect()) as conn:
+            total, chinese = conn.execute("SELECT COUNT(*), COUNT(DISTINCT cn_name) FROM tags").fetchone()
+        return {"loaded": True, "en_to_cn_count": total, "cn_to_en_count": chinese}
 
 
-# Global translation loader instance
-_translation_loader = None
+_translation_loader = TranslationLoader()
 
 
-def get_translation_loader() -> TranslationLoader:
-    """Get global translation loader instance"""
-    global _translation_loader
-    if _translation_loader is None:
-        _translation_loader = TranslationLoader()
+def get_translation_loader():
     return _translation_loader
-
-
-def test_translation_loader():
-    """Test the translation loader"""
-    loader = TranslationLoader()
-    loader.load_all()
-
-    # Test EN -> CN
-    logger.info("\nTest EN -> CN:")
-    test_tags = ["1girl", "solo", "long_hair", "white_hair", "red_eyes"]
-    for tag in test_tags:
-        cn = loader.get_chinese(tag)
-        logger.info(f"  {tag} -> {cn}")
-
-    # Test CN -> EN
-    logger.info("\nTest CN -> EN:")
-    test_cn = ["1个女孩", "独自", "长发"]
-    for cn in test_cn:
-        en = loader.get_english(cn)
-        logger.info(f"  {cn} -> {en}")
-
-    # Test search
-    logger.info("\nTest CN search:")
-    results = loader.search_chinese("白发", limit=5)
-    for en, cn in results:
-        logger.info(f"  {en} -> {cn}")
-
-    # Test stats
-    logger.info("\nStats:")
-    stats = loader.get_stats()
-    logger.info(f"  EN->CN: {stats['en_to_cn_count']}")
-    logger.info(f"  CN->EN: {stats['cn_to_en_count']}")
-
-
-if __name__ == "__main__":
-    test_translation_loader()

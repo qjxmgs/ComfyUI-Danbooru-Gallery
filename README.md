@@ -126,3 +126,19 @@ pip install -r requirements.txt
 ## 📄 许可证
 
 [MIT](LICENSE)
+
+## 提示词翻译词库
+
+画廊独立使用 ffdkj/ffdkj-Danbooru_Tag-Chinese-English-Translation-Table 的 `tag.sqlite`（MIT），与 Prompt Weaver 使用相同上游，但不共享文件和设置。旧 JSON/CSV 不再参与翻译；未收录标签保留英文。精确翻译不按使用次数过滤。
+
+在本项目目录手动管理：
+
+```powershell
+python tools/manage_translation_dictionary.py --download
+python tools/manage_translation_dictionary.py --import-file "D:\词库\tag.sqlite"
+python tools/manage_translation_dictionary.py --status
+```
+
+词库存放在 `py/shared/data/tag.sqlite`。下载和导入先验证，再替换；失败保留原词库。更新后刷新浏览器以清除前端查询缓存。服务启动不会自动联网更新。
+
+画廊设置 → 界面 → 自动补全中的“词条最少作品数”默认 100，最低 10；Danbooru 联想及中文搜索只返回作品数达到阈值的词条。图片已有标签的精确翻译不受限制。词库按需查询，不会一次载入全部词条。

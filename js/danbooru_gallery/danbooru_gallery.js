@@ -1625,6 +1625,17 @@ app.registerExtension({
                     autocompleteSection.appendChild(autocompleteDesc);
                     autocompleteSection.appendChild(autocompleteEnableDiv);
                     autocompleteSection.appendChild(autocompleteMaxResultsDiv);
+                    const minPostCountInput = $el("input", {
+                        type: "number", min: "10", max: String(Number.MAX_SAFE_INTEGER), step: "1", required: true,
+                        value: initialState.minPostCount ?? uiSettings.autocomplete_min_post_count ?? 100,
+                        style: { width: "100px", marginLeft: "8px" },
+                    });
+                    autocompleteSection.appendChild($el("label", {
+                        textContent: t('autocompleteMinPostCount'),
+                        title: t('autocompleteMinPostCountHelp'),
+                        style: { display: "block", marginTop: "12px", color: "var(--comfy-input-text)" },
+                    }, [minPostCountInput]));
+
 
                     // 悬浮提示设置
                     const tooltipSection = $el("div.danbooru-settings-section", { style: { marginBottom: "20px", padding: "16px", border: "1px solid var(--input-border-color)", borderRadius: "8px", backgroundColor: "var(--comfy-input-bg)" } });
@@ -1903,6 +1914,8 @@ app.registerExtension({
                                 }
                             }
 
+                            if (!minPostCountInput.reportValidity()) return;
+                            const newMinPostCount = Number(minPostCountInput.value);
                             const newAutocompleteEnabled = autocompleteEnableCheckbox.checked;
                             const newTooltipEnabled = tooltipEnableCheckbox.checked;
                             const newAutocompleteMaxResults = parseInt(autocompleteMaxResultsInput.value, 10);
@@ -1917,6 +1930,7 @@ app.registerExtension({
                                     autocomplete_enabled: newAutocompleteEnabled,
                                     tooltip_enabled: newTooltipEnabled,
                                     autocomplete_max_results: newAutocompleteMaxResults,
+                                    autocomplete_min_post_count: newMinPostCount,
                                     selected_categories: newSelectedCategories,
                                     multi_select_enabled: newMultiSelectEnabled,
                                     source_site: uiSettings.source_site || "danbooru",
@@ -1932,6 +1946,8 @@ app.registerExtension({
                                 uiSettings.autocomplete_enabled = newAutocompleteEnabled;
                                 uiSettings.tooltip_enabled = newTooltipEnabled;
                                 uiSettings.autocomplete_max_results = newAutocompleteMaxResults;
+                                uiSettings.autocomplete_min_post_count = newMinPostCount;
+                                globalAutocompleteCache.clearCache();
                                 uiSettings.selected_categories = newSelectedCategories;
                                 uiSettings.multi_select_enabled = newMultiSelectEnabled;
                                 uiSettings.source_site = sourceSelect.value || uiSettings.source_site || "danbooru";
@@ -2029,6 +2045,7 @@ app.registerExtension({
                                 autocompleteEnabled: autocompleteEnableCheckbox.checked,
                                 tooltipEnabled: tooltipEnableCheckbox.checked,
                                 autocompleteMaxResults: autocompleteMaxResultsInput.value,
+                                minPostCount: minPostCountInput.value,
                             };
 
                             const success = await saveLanguage(lang);
@@ -2335,6 +2352,7 @@ app.registerExtension({
                     autocomplete_enabled: true,
                     tooltip_enabled: true,
                     autocomplete_max_results: 20,
+                    autocomplete_min_post_count: 100,
                     selected_categories: ["copyright", "character", "general"],
                     multi_select_enabled: false,
                     source_site: "danbooru",
@@ -2354,6 +2372,7 @@ app.registerExtension({
                                 autocomplete_enabled: data.settings.autocomplete_enabled,
                                 tooltip_enabled: data.settings.tooltip_enabled,
                                 autocomplete_max_results: data.settings.autocomplete_max_results || 20,
+                                autocomplete_min_post_count: data.settings.autocomplete_min_post_count ?? 100,
                                 selected_categories: data.settings.selected_categories || ["copyright", "character", "general"],
                                 multi_select_enabled: data.settings.multi_select_enabled || false,
                                 source_site: data.settings.source_site || "danbooru",
@@ -3535,11 +3554,12 @@ app.registerExtension({
                     tagsContainer.innerHTML = ''; // Clear existing tags
 
                     const createClickableTagSpan = (tag, category, translation = null) => {
-                        const displayText = translation ? `${tag} [${translation}]` : tag;
                         const span = $el("span", {
-                            textContent: displayText,
                             className: `danbooru-tooltip-tag danbooru-clickable-tag tag-category-${category}`,
-                        });
+                        }, [
+                            $el("span.danbooru-tag-english", { textContent: tag }),
+                            $el("span.danbooru-tag-translation", { textContent: translation || "—" }),
+                        ]);
 
                         const removeExistingMenus = () => {
                             document.querySelectorAll('.danbooru-tag-context-menu').forEach(menu => menu.remove());
@@ -4181,11 +4201,12 @@ app.registerExtension({
                     }
 
                     const createTagSpan = (tag, category, translation = null) => {
-                        const displayText = translation ? `${tag} [${translation}]` : tag;
                         return $el("span", {
-                            textContent: displayText,
                             className: `danbooru-tooltip-tag tag-category-${category}`,
-                        });
+                        }, [
+                            $el("span.danbooru-tag-english", { textContent: tag }),
+                            $el("span.danbooru-tag-translation", { textContent: translation || "—" }),
+                        ]);
                     };
 
                     let currentClickHandler = null;
@@ -5682,9 +5703,19 @@ $el("style", {
         .danbooru-tooltip-tag {
             font-size: 0.8em;
             font-weight: 500;
-            color: white;
-            padding: 2px 6px;
-            border-radius: 4px;
+            display: inline-flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 2px;
+            max-width: 100%;
+            box-sizing: border-box;
+            color: var(--danbooru-tag-color, #9db8f4);
+            background-color: var(--danbooru-tag-bg, #303746);
+            border: 1px solid var(--danbooru-tag-border, #788fb9);
+            padding: 5px 9px;
+            border-radius: 6px;
+            line-height: 1.25;
+            overflow-wrap: anywhere;
             cursor: default; /* Change cursor to default */
             transition: none; /* Remove transitions */
         }
@@ -5704,13 +5735,39 @@ $el("style", {
             100% { transform: scale(1); }
         }
         
-        /* Tag Colors */
-        /* Tag Colors based on new categories */
-        .danbooru-tooltip-tag.tag-category-artist { background-color: #FFF3CD; color: #664D03; } /* Artist: Light Yellow */
-        .danbooru-tooltip-tag.tag-category-copyright { background-color: #F8D7DA; color: #58151D; } /* Copyright: Light Pink */
-        .danbooru-tooltip-tag.tag-category-character { background-color: #D4EDDA; color: #155724; } /* Character: Light Green */
-        .danbooru-tooltip-tag.tag-category-general { background-color: #D1ECF1; color: #0C5460; } /* General: Light Blue */
-        .danbooru-tooltip-tag.tag-category-meta { background-color: #F8F9FA; color: #383D41; border: 1px solid #DFE2E5; } /* Meta: Light Grey */
+        .danbooru-tag-english {
+            font-size: 1em;
+        }
+        .danbooru-tag-translation {
+            font-size: 0.8em;
+            font-weight: 400;
+            opacity: 0.75;
+        }
+        .danbooru-tooltip-tag.tag-category-general {
+            --danbooru-tag-color: #9db8f4;
+            --danbooru-tag-bg: #303746;
+            --danbooru-tag-border: #788fb9;
+        }
+        .danbooru-tooltip-tag.tag-category-artist {
+            --danbooru-tag-color: #79d3e6;
+            --danbooru-tag-bg: #293e43;
+            --danbooru-tag-border: #5898a6;
+        }
+        .danbooru-tooltip-tag.tag-category-character {
+            --danbooru-tag-color: #81d7a5;
+            --danbooru-tag-bg: #2d3e34;
+            --danbooru-tag-border: #649d79;
+        }
+        .danbooru-tooltip-tag.tag-category-copyright {
+            --danbooru-tag-color: #c4a3ef;
+            --danbooru-tag-bg: #3b3247;
+            --danbooru-tag-border: #9374af;
+        }
+        .danbooru-tooltip-tag.tag-category-meta {
+            --danbooru-tag-color: #ed9fc5;
+            --danbooru-tag-bg: #44313d;
+            --danbooru-tag-border: #ae7693;
+        }
 
         .danbooru-layered-error {
             width: 100%;

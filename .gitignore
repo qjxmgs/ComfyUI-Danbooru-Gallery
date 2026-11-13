@@ -120,3 +120,7 @@ comfyui-tooling-nodes-main/
 nul
 CLAUDE.md
 .auto-claude/
+
+# Independent translation dictionary
+py/shared/data/tag.sqlite
+py/shared/data/dictionary-*.sqlite
