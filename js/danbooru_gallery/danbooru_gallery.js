@@ -4062,6 +4062,7 @@ app.registerExtension({
                                 fresh.onerror = () => { wrapper.style.display = 'none'; };
                                 wrapper.innerHTML = '';
                                 wrapper.appendChild(fresh);
+                                wrapper.appendChild(copyPromptButton);
                             };
                         },
                         onclick: async (e) => {
@@ -4100,6 +4101,30 @@ app.registerExtension({
                                 if (wrapper.classList.contains('selected')) updateSelectionData();
                             }
                         },
+                    });
+
+                    const copyPromptButton = $el("button.danbooru-copy-prompt-button", {
+                        type: "button",
+                        title: t('copyPrompt'),
+                        ariaLabel: t('copyPrompt'),
+                        innerHTML: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
+                        onpointerdown: (e) => e.stopPropagation(),
+                        ondblclick: (e) => e.stopPropagation(),
+                        onclick: async (e) => {
+                            e.stopPropagation();
+                            const prompt = buildPromptForPost(post);
+                            if (!prompt) {
+                                showToast(t('noTagsToCopy'), 'info', copyPromptButton);
+                                return;
+                            }
+                            try {
+                                await navigator.clipboard.writeText(prompt);
+                                showToast(t('copyTagsSuccess'), 'success', copyPromptButton);
+                            } catch (error) {
+                                showToast(t('copyTagsFail'), 'error', copyPromptButton);
+                                logger.error('Failed to copy prompt: ', error);
+                            }
+                        }
                     });
 
                     // 创建下载按钮
@@ -4408,6 +4433,7 @@ app.registerExtension({
 
                     wrapper.appendChild(img);
                     wrapper.appendChild(buttonsContainer);
+                    wrapper.appendChild(copyPromptButton);
                     observeGelbooruPrefetch(wrapper, post);
 
                     return wrapper;
@@ -5515,7 +5541,8 @@ $el("style", {
     }
 
     /* 通用按钮样式 */
-    .danbooru-image-buttons button {
+    .danbooru-image-buttons button,
+    .danbooru-copy-prompt-button {
         background-color: rgba(0, 0, 0, 0.8) !important;
         color: white !important;
         border: none !important;
@@ -5533,7 +5560,20 @@ $el("style", {
         margin: 0 !important;
     }
 
-    .danbooru-image-buttons button:hover {
+    .danbooru-copy-prompt-button {
+        position: absolute;
+        right: 3px;
+        bottom: 3px;
+        z-index: 15;
+    }
+
+    .danbooru-copy-prompt-button:focus-visible {
+        outline: 2px solid #7B68EE;
+        outline-offset: 2px;
+    }
+
+    .danbooru-image-buttons button:hover,
+    .danbooru-copy-prompt-button:hover {
         transform: scale(1.1) !important;
         background-color: rgba(123, 104, 238, 0.9) !important; /* 统一使用紫色悬浮效果 */
     }
