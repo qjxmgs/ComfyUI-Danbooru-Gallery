@@ -25,6 +25,7 @@ from .site_clients import DanbooruHttpClient, GelbooruHttpClient
 from .post_cache import get_gallery_post_cache
 from .thumbnail_cache import get_thumbnail, save_thumbnail
 from .offline_routes import OfflineGallery
+from .local_favorites import LocalFavorites, LocalFavoritesStore, has_details
 from ..shared.translation.translation_loader import get_translation_loader
 from functools import partial
 
@@ -154,7 +155,7 @@ def build_gallery_error_payload(source, action, exc=None, response=None, message
             "suggestions": [
                 "稍等 30-120 秒后重试，避免连续刷新触发限流。",
                 "确认代理/网络可以直接打开对应站点页面。",
-                "如果使用收藏或私有内容，重新检查 User ID/API Key 是否正确。",
+                "如果在线浏览受限，重新检查 User ID/API Key 是否正确。",
             ],
             "tip": "看不懂也没关系，把详情复制给 AI 问问。它很擅长把这些小刺猬一样的报错梳顺。",
             "details": details,
@@ -325,17 +326,6 @@ def has_required_site_credentials(adapter, credentials):
         return bool(credentials.get("user_id") and credentials.get("api_key"))
     return True
 
-def load_favorites():
-    """从统一设置文件加载收藏列表"""
-    settings = load_settings()
-    return settings.get("favorites", [])
-
-def save_favorites(favorites):
-    """保存收藏列表到统一设置文件"""
-    settings = load_settings()
-    settings["favorites"] = favorites
-    return save_settings(settings)
-
 def load_language():
     """从统一设置文件加载语言设置"""
     settings = load_settings()
@@ -466,363 +456,6 @@ def verify_danbooru_auth(username, api_key):
         logger.error(f"验证用户认证失败: {e}")
         return False, True
 
-def get_user_favorites(username, api_key):
-    """获取用户的收藏列表"""
-    try:
-        favorites_url = f"{BASE_URL}/favorites.json?login={username}&api_key={api_key}"
-        response = _danbooru_request("GET", favorites_url, auth=HTTPBasicAuth(username, api_key), timeout=15)
-        if response.status_code == 200:
-            return response.json()
-        return []
-    except Exception as e:
-        logger.error(f"获取用户收藏列表失败: {e}")
-        return []
-
-# --- 省略其他不相关的路由和函数以保持简洁 ---
-
-def get_gelbooru_favorites(user_id, api_key, limit=1000):
-    """Fetch Gelbooru favorite post IDs for the configured user."""
-    if not user_id or not api_key:
-        return []
-    if not str(user_id).isdigit():
-        raise ValueError("Gelbooru User ID must be numeric")
-
-    adapter = get_site_adapter("gelbooru")
-    credentials = {"user_id": user_id, "api_key": api_key}
-
-    # Gelbooru's documented favorite DAPI may return an empty list for valid API
-    # credentials, while the site's own favorites link uses the fav:<user_id> tag.
-    favorite_posts = []
-    page = 1
-    per_page = min(max(int(limit), 1), 100)
-    while len(favorite_posts) < limit:
-        params = adapter.build_posts_params(f"fav:{user_id}", per_page, page, None)
-        params = adapter.apply_auth_params(params, credentials)
-        response = _gelbooru_request("GET", adapter.posts_url, request_kind="api", params=params, timeout=15)
-        response.raise_for_status()
-        posts = adapter.normalize_posts_response(response.json())
-        if not posts:
-            break
-        favorite_posts.extend(str(post.get("id")) for post in posts if post.get("id"))
-        if len(posts) < per_page:
-            break
-        page += 1
-
-    if favorite_posts:
-        return favorite_posts[:limit]
-
-    all_ids = []
-    page = 1
-
-    while len(all_ids) < limit:
-        params = adapter.build_favorites_params(user_id, per_page, page)
-        params = adapter.apply_auth_params(params, credentials)
-        response = _gelbooru_request("GET", adapter.posts_url, request_kind="api", params=params, timeout=15)
-        if response.status_code == 401:
-            raise requests.exceptions.HTTPError("Gelbooru favorite API authentication failed", response=response)
-        response.raise_for_status()
-        page_ids = adapter.normalize_favorites_response(response.json())
-        if not page_ids:
-            break
-        all_ids.extend(page_ids)
-        if len(page_ids) < per_page:
-            break
-        page += 1
-
-    return all_ids[:limit]
-
-def add_gelbooru_favorite(post_id, user_id, api_key):
-    """Add a Gelbooru favorite via the site's favorite endpoint."""
-    if not user_id or not api_key:
-        return False, "请先在设置中配置 Gelbooru User ID 和 API Key"
-
-    display_all = load_ui_settings().get("gelbooru_display_all_site_content", False)
-    response = _gelbooru_request(
-        "GET",
-        "https://gelbooru.com/public/addfav.php",
-        request_kind="api",
-        display_all=display_all,
-        params={"id": str(post_id), "user_id": user_id, "api_key": api_key},
-        headers=_gelbooru_browser_headers("*/*"),
-        timeout=(8, 15),
-    )
-    response.raise_for_status()
-    body = (response.text or "").strip()
-    if body == "1":
-        return True, "已收藏，无需重复操作"
-    if body == "2":
-        return False, "Gelbooru 返回未登录；该站点的添加收藏接口可能不接受 API-only 认证"
-    return True, "收藏成功"
-
-def remove_gelbooru_favorite(post_id, user_id, api_key):
-    """Remove a Gelbooru favorite via the site's favorite page endpoint."""
-    if not user_id or not api_key:
-        return False, "请先在设置中配置 Gelbooru User ID 和 API Key"
-
-    display_all = load_ui_settings().get("gelbooru_display_all_site_content", False)
-    response = _gelbooru_request(
-        "GET",
-        "https://gelbooru.com/index.php",
-        request_kind="api",
-        display_all=display_all,
-        params={
-            "page": "favorites",
-            "s": "delete",
-            "id": str(post_id),
-            "user_id": user_id,
-            "api_key": api_key,
-        },
-        headers=_gelbooru_browser_headers("text/html,*/*"),
-        allow_redirects=False,
-        timeout=(8, 15),
-    )
-    if response.status_code in (200, 302, 303):
-        location = response.headers.get("Location", "")
-        if "account" in location and "login" in location:
-            return False, "Gelbooru 返回登录页；该站点的取消收藏接口可能不接受 API-only 认证"
-        return True, "取消收藏成功"
-    response.raise_for_status()
-    return True, "取消收藏成功"
-
-@PromptServer.instance.routes.post("/danbooru_gallery/favorites/add")
-async def add_favorite(request):
-    """添加收藏"""
-    try:
-        data = await request.json()
-        post_id = data.get("post_id")
-        source = data.get("source", "danbooru")
-        adapter = get_site_adapter(source)
-        if adapter.key == "danbooru":
-            scope, store = offline_gallery.scope(request)
-            if await offline_gallery.is_local(scope, store):
-                return web.json_response({"success": False, "connected": False, "favorites": [], "error": "仅本地浏览，需手动重试联网"})
-
-
-        if not post_id:
-            return web.json_response({"success": False, "error": "缺少post_id"})
-
-        if adapter.key == "gelbooru":
-            user_id, gelbooru_api_key = load_gelbooru_auth()
-            try:
-                ok, message = await _run_http_request(
-                    add_gelbooru_favorite,
-                    post_id,
-                    user_id,
-                    gelbooru_api_key,
-                )
-                return web.json_response({"success": ok, "message": message, "error": None if ok else message})
-            except requests.exceptions.Timeout as e:
-                logger.error("[Gelbooru] 添加收藏请求超时")
-                payload = {"success": False}
-                payload.update(build_gallery_error_payload(adapter.key, "添加收藏", exc=e, retries_exhausted=True, retry_count=1))
-                return web.json_response(payload)
-            except requests.exceptions.RequestException as e:
-                logger.error(f"[Gelbooru] 添加收藏请求失败: {type(e).__name__}")
-                payload = {"success": False}
-                payload.update(build_gallery_error_payload(adapter.key, "添加收藏", exc=e, retries_exhausted=True, retry_count=1))
-                return web.json_response(payload)
-
-        username, api_key = load_user_auth()
-        if not username or not api_key:
-            return web.json_response({"success": False, "error": "请先在设置中配置用户名和API Key"})
-
-        # 验证认证
-        is_valid, is_network_error = await _run_http_request(
-            verify_danbooru_auth,
-            username,
-            api_key,
-        )
-        if is_network_error:
-            return web.json_response({"success": False, "error": "网络错误，无法连接到Danbooru服务器"})
-        if not is_valid:
-            return web.json_response({"success": False, "error": "认证无效，请检查用户名和API Key"})
-
-        try:
-            favorite_url = f"{BASE_URL}/favorites.json?login={username}&api_key={api_key}"
-            response = await _run_http_request(
-                _danbooru_request,
-                "POST",
-                favorite_url,
-                auth=HTTPBasicAuth(username, api_key),
-                data={"post_id": post_id},
-                timeout=15,
-            )
-
-
-            if response.status_code in [200, 201]:
-                favorites = load_favorites()
-                if str(post_id) not in favorites:
-                    favorites.append(str(post_id))
-                    save_favorites(favorites)
-                return web.json_response({"success": True, "message": "收藏成功"})
-            
-            try:
-                error_data = response.json()
-                reason = error_data.get("reason", "未知")
-                message = error_data.get("message", "没有提供具体信息")
-            except (json.JSONDecodeError, ValueError):
-                error_data = {}
-                reason = "无法解析响应"
-                message = response.text
-
-            if response.status_code == 422 and "You have already favorited this post" in message:
-                favorites = load_favorites()
-                if str(post_id) not in favorites:
-                    favorites.append(str(post_id))
-                    save_favorites(favorites)
-                return web.json_response({"success": True, "message": "已收藏，无需重复操作"})
-                
-            error_map = {
-                401: "认证失败，请检查用户名和API Key",
-                403: "权限不足，可能需要Gold账户或更高权限",
-                404: "图片不存在",
-                429: "请求过于频繁，请稍后重试 (Rate Limited)",
-            }
-            
-            error_message = error_map.get(response.status_code, f"收藏失败，状态码: {response.status_code}, 原因: {message}")
-            logger.error(error_message)
-            return web.json_response({"success": False, "error": error_message})
-
-        except requests.exceptions.Timeout as e:
-            logger.error("添加收藏时网络请求超时")
-            payload = {"success": False}
-            payload.update(build_gallery_error_payload(adapter.key, "添加收藏", exc=e, retries_exhausted=True, retry_count=1))
-            return web.json_response(payload)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"添加收藏时网络请求失败: {e}")
-            payload = {"success": False}
-            payload.update(build_gallery_error_payload(adapter.key, "添加收藏", exc=e, retries_exhausted=True, retry_count=1))
-            return web.json_response(payload)
-        except Exception as e:
-            import traceback
-            logger.error(f"添加收藏时发生严重错误: {e}")
-            logger.error(traceback.format_exc())
-            return web.json_response({"success": False, "error": f"服务器内部错误: {e}"}, status=500)
-
-    except Exception as e:
-        logger.error(f"添加收藏接口错误: {e}")
-        return web.json_response({"success": False, "error": str(e)}, status=500)
-
-@PromptServer.instance.routes.post("/danbooru_gallery/favorites/remove")
-async def remove_favorite(request):
-    """移除收藏"""
-    try:
-        data = await request.json()
-        post_id = data.get("post_id")
-        source = data.get("source", "danbooru")
-        adapter = get_site_adapter(source)
-        if adapter.key == "danbooru":
-            scope, store = offline_gallery.scope(request)
-            if await offline_gallery.is_local(scope, store):
-                return web.json_response({"success": False, "connected": False, "favorites": [], "error": "仅本地浏览，需手动重试联网"})
-
-
-        if not post_id:
-            return web.json_response({"success": False, "error": "缺少post_id"})
-
-        if adapter.key == "gelbooru":
-            user_id, gelbooru_api_key = load_gelbooru_auth()
-            try:
-                ok, message = await _run_http_request(
-                    remove_gelbooru_favorite,
-                    post_id,
-                    user_id,
-                    gelbooru_api_key,
-                )
-                return web.json_response({"success": ok, "message": message, "error": None if ok else message})
-            except requests.exceptions.Timeout as e:
-                logger.error("[Gelbooru] 取消收藏请求超时")
-                payload = {"success": False}
-                payload.update(build_gallery_error_payload(adapter.key, "取消收藏", exc=e, retries_exhausted=True, retry_count=1))
-                return web.json_response(payload)
-            except requests.exceptions.RequestException as e:
-                logger.error(f"[Gelbooru] 取消收藏请求失败: {type(e).__name__}")
-                payload = {"success": False}
-                payload.update(build_gallery_error_payload(adapter.key, "取消收藏", exc=e, retries_exhausted=True, retry_count=1))
-                return web.json_response(payload)
-        
-        username, api_key = load_user_auth()
-        if not username or not api_key:
-            return web.json_response({"success": False, "error": "请先在设置中配置用户名和API Key"})
-
-        # 验证认证
-        is_valid, is_network_error = await _run_http_request(
-            verify_danbooru_auth,
-            username,
-            api_key,
-        )
-        if is_network_error:
-            return web.json_response({"success": False, "error": "网络错误，无法连接到Danbooru服务器"})
-        if not is_valid:
-            return web.json_response({"success": False, "error": "认证无效，请检查用户名和API Key"})
-        
-        try:
-            # 直接使用帖子ID删除收藏
-            delete_url = f"{BASE_URL}/favorites/{post_id}.json?login={username}&api_key={api_key}"
-            delete_response = await _run_http_request(
-                _danbooru_request,
-                "DELETE",
-                delete_url,
-                auth=HTTPBasicAuth(username, api_key),
-                timeout=15,
-            )
-
-
-            if delete_response.status_code in [200, 204]:
-                favorites = load_favorites()
-                if str(post_id) in favorites:
-                    favorites.remove(str(post_id))
-                    save_favorites(favorites)
-                return web.json_response({"success": True, "message": "取消收藏成功"})
-            elif delete_response.status_code == 404:
-                # 如果收藏不存在，视为已删除
-                favorites = load_favorites()
-                if str(post_id) in favorites:
-                    favorites.remove(str(post_id))
-                    save_favorites(favorites)
-                return web.json_response({"success": True, "message": "该图片未在云端收藏，本地已同步"})
-
-            # 如果有收藏记录但删除失败，解析错误
-            try:
-                error_data = delete_response.json()
-                reason = error_data.get("reason", "未知")
-                message = error_data.get("message", "没有提供具体信息")
-            except (json.JSONDecodeError, ValueError):
-                error_data = {}
-                reason = "无法解析响应"
-                message = delete_response.text
-
-            error_map = {
-                401: "认证失败，请检查用户名和API Key",
-                403: "权限不足，可能需要Gold账户",
-                404: "收藏记录不存在",
-                429: "请求过于频繁，请稍后重试 (Rate Limited)",
-            }
-
-            error_message = error_map.get(delete_response.status_code, f"取消收藏失败，状态码: {delete_response.status_code}, 原因: {message}")
-            logger.error(error_message)
-            return web.json_response({"success": False, "error": error_message})
-
-        except requests.exceptions.Timeout as e:
-            logger.error("移除收藏时网络请求超时")
-            payload = {"success": False}
-            payload.update(build_gallery_error_payload(adapter.key, "取消收藏", exc=e, retries_exhausted=True, retry_count=1))
-            return web.json_response(payload)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"移除收藏时网络请求失败: {e}")
-            payload = {"success": False}
-            payload.update(build_gallery_error_payload(adapter.key, "取消收藏", exc=e, retries_exhausted=True, retry_count=1))
-            return web.json_response(payload)
-        except Exception as e:
-            import traceback
-            logger.error(f"移除收藏时发生严重错误: {e}")
-            logger.error(traceback.format_exc())
-            return web.json_response({"success": False, "error": f"服务器内部错误: {e}"}, status=500)
-
-    except Exception as e:
-        logger.error(f"移除收藏接口错误: {e}")
-        return web.json_response({"success": False, "error": str(e)}, status=500)
-
 @PromptServer.instance.routes.get("/danbooru_gallery/user_auth")
 async def get_user_auth_route(request):
     """获取用户认证信息"""
@@ -841,76 +474,6 @@ async def get_user_auth_route(request):
         })
     except Exception as e:
         logger.error(f"获取用户认证接口错误: {e}")
-        return web.json_response({"success": False, "error": str(e)}, status=500)
-
-@PromptServer.instance.routes.get("/danbooru_gallery/favorites")
-async def get_favorites_route(request):
-    """获取收藏列表"""
-    try:
-        source = request.query.get("source") or load_ui_settings().get("source_site", "danbooru")
-        adapter = get_site_adapter(source)
-        if adapter.key == "danbooru":
-            scope, store = offline_gallery.scope(request)
-            if await offline_gallery.is_local(scope, store):
-                return web.json_response({"success": False, "connected": False, "favorites": [], "error": "仅本地浏览，需手动重试联网"})
-
-        if adapter.key == "gelbooru":
-            user_id, gelbooru_api_key = load_gelbooru_auth()
-            if not user_id or not gelbooru_api_key:
-                return web.json_response({
-                    "success": False,
-                    "favorites": [],
-                    "source": adapter.key,
-                    "error": "请先在设置中配置 Gelbooru User ID 和 API Key"
-                })
-            try:
-                favorites = await _run_http_request(
-                    get_gelbooru_favorites,
-                    user_id,
-                    gelbooru_api_key,
-                )
-                return web.json_response({"success": True, "favorites": favorites, "source": adapter.key})
-            except requests.exceptions.Timeout as e:
-                logger.error("[Gelbooru] 获取收藏列表超时")
-                payload = {
-                    "success": False,
-                    "favorites": [],
-                    "source": adapter.key,
-                }
-                payload.update(build_gallery_error_payload(adapter.key, "读取收藏列表", exc=e, retries_exhausted=True, retry_count=1))
-                return web.json_response(payload)
-            except requests.exceptions.HTTPError as e:
-                status_code = e.response.status_code if e.response is not None else "unknown"
-                logger.error(f"[Gelbooru] 获取收藏列表失败: HTTP {status_code}")
-                payload = {
-                    "success": False,
-                    "favorites": [],
-                    "source": adapter.key,
-                }
-                payload.update(build_gallery_error_payload(adapter.key, "读取收藏列表", exc=e, retries_exhausted=True, retry_count=1))
-                return web.json_response(payload)
-            except ValueError as e:
-                logger.error(f"[Gelbooru] 收藏列表配置无效: {e}")
-                return web.json_response({
-                    "success": False,
-                    "favorites": [],
-                    "source": adapter.key,
-                    "error": "Gelbooru User ID 必须是数字 ID，不是用户名"
-                })
-            except requests.exceptions.RequestException as e:
-                logger.error(f"[Gelbooru] 获取收藏列表请求失败: {type(e).__name__}")
-                payload = {
-                    "success": False,
-                    "favorites": [],
-                    "source": adapter.key,
-                }
-                payload.update(build_gallery_error_payload(adapter.key, "读取收藏列表", exc=e, retries_exhausted=True, retry_count=1))
-                return web.json_response(payload)
-
-        favorites = load_favorites()
-        return web.json_response({"success": True, "favorites": favorites, "source": adapter.key})
-    except Exception as e:
-        logger.error(f"获取收藏列表接口错误: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 @PromptServer.instance.routes.post("/danbooru_gallery/user_auth")
@@ -1319,6 +882,55 @@ async def image_proxy(request):
 # --- 保留文件中剩余的其他部分 ---
 offline_gallery = OfflineGallery(PromptServer.instance, load_user_auth, _danbooru_request,
                                  _image_proxy_headers_for_host, translation_system)
+
+
+async def _favorite_cached_thumbnail(request, source, post):
+    url = post.get("preview_file_url") or ""
+    if not url:
+        return None
+    data = await asyncio.to_thread(get_thumbnail, url)
+    if data is None and post.get("md5"):
+        data = await asyncio.to_thread(get_thumbnail, f"{url}?v={post['md5']}")
+    if data is None and source == "danbooru":
+        _, store = offline_gallery.scope(request)
+        data = await asyncio.to_thread(store.thumbnail, url)
+    return data
+
+
+async def _complete_local_favorite(request, source, post):
+    thumb = await asyncio.to_thread(local_favorites.store.thumbnail, source, post['id'])
+    if thumb is None:
+        thumb = await _favorite_cached_thumbnail(request, source, post)
+    if source == "danbooru":
+        scope, store = offline_gallery.scope(request)
+        if await offline_gallery.is_local(scope, store):
+            return post, thumb
+    if not has_details(post):
+        try:
+            if source == "danbooru":
+                response = await asyncio.to_thread(_danbooru_request, "GET",
+                    f"{BASE_URL}/posts/{post['id']}.json", timeout=(8, 15))
+                response.raise_for_status()
+                details = response.json()
+            else:
+                raw, = await asyncio.to_thread(DanbooruGalleryNode.get_posts_internal,
+                    tags=f"id:{post['id']}", limit=1, source=source, force_public_detail=True)
+                details = next((item for item in json.loads(raw) if str(item.get('id')) == str(post['id']) and not item.get('error')), {})
+            if isinstance(details, dict) and str(details.get('id')) == str(post['id']):
+                post = {**post, **details}
+        except (requests.RequestException, ValueError, OSError) as error:
+            logger.debug("Favorite details unavailable: %s", type(error).__name__)
+    if thumb is None and post.get('preview_file_url'):
+        try:
+            data = await asyncio.to_thread(_fetch_supported_media, post['preview_file_url'])
+            thumb = await asyncio.to_thread(save_thumbnail, post['preview_file_url'], data)
+        except (requests.RequestException, ValueError, OSError) as error:
+            logger.debug("Favorite thumbnail unavailable: %s", type(error).__name__)
+    return post, thumb
+
+
+local_favorites = LocalFavorites(PromptServer.instance.routes, LocalFavoritesStore(),
+    _favorite_cached_thumbnail, _complete_local_favorite, translation_system.get_english)
 
 
 @PromptServer.instance.routes.get("/danbooru_gallery/posts")

@@ -14,7 +14,6 @@ class GallerySiteAdapter:
     key = ""
     base_url = ""
     requires_auth = False
-    supports_favorites = False
 
     def build_posts_params(self, tags: str, limit: int, page: int, rating: Optional[str]) -> Dict[str, Any]:
         raise NotImplementedError
@@ -48,7 +47,6 @@ class DanbooruAdapter(GallerySiteAdapter):
     key = "danbooru"
     base_url = "https://danbooru.donmai.us"
     requires_auth = False
-    supports_favorites = True
 
     @property
     def posts_url(self) -> str:
@@ -82,7 +80,6 @@ class DanbooruAdapter(GallerySiteAdapter):
 class GelbooruAdapter(GallerySiteAdapter):
     key = "gelbooru"
     base_url = "https://gelbooru.com"
-    supports_favorites = True
 
     @property
     def posts_url(self) -> str:
@@ -129,28 +126,6 @@ class GelbooruAdapter(GallerySiteAdapter):
             "s": "view",
             "id": str(post_id),
         }
-
-    def build_favorites_params(self, user_id: str, limit: int, page: int) -> Dict[str, Any]:
-        return {
-            "page": "dapi",
-            "s": "favorite",
-            "q": "index",
-            "json": "1",
-            "id": str(user_id),
-            "limit": limit,
-            "pid": max(page - 1, 0),
-        }
-
-    def normalize_favorites_response(self, payload: Any) -> List[str]:
-        favorites = self._extract_list(payload)
-        ids = []
-        for item in favorites:
-            if not isinstance(item, dict):
-                continue
-            post_id = item.get("favorite") or item.get("post_id") or item.get("id")
-            if post_id:
-                ids.append(str(post_id))
-        return ids
 
     def build_autocomplete_params(self, query: str, limit: int) -> Dict[str, Any]:
         return {

@@ -148,9 +148,17 @@ python tools/manage_translation_dictionary.py --status
 ComfyUI 本地服务运行时，可在设置 → 离线管理中选择“自动联网”或“仅本地”。自动模式在 API 请求失败后尝试恢复相同查询的历史页面，并暂停联网；“重试联网”才恢复在线请求。没有缓存的页面会保留当前内容并提示缺页，不视为网站没有更多图片。
 
 - “历史记录”恢复已保存页面及顺序；“搜索本地已缓存图片”在当前账号的全部历史帖子中搜索。普通标签取交集，`-tag` 排除；支持中文标签、评分、`date:2026-01-01..2026-12-31`（可省略一侧日期）、`order:newest`、`order:oldest`、`order:id`、`order:id_asc`、`order:id_desc` 和 `order:score`。排行榜等其他站点语法仅支持恢复已有历史，不作为本地搜索条件执行。
-- 成功页面的元数据立即保存，缩略图由最多两个并发任务补齐。补齐前断网的图片显示占位卡，标签仍可编辑、启停、翻译和复制；原图查看、下载、在线收藏和工作流图像输出需要联网。
+- 成功页面的元数据立即保存，缩略图由最多两个并发任务补齐。补齐前断网的图片显示占位卡，标签仍可编辑、启停、翻译和复制；原图查看、下载和工作流图像输出需要联网；本地收藏无需联网。
 - 数据保存在项目 `py/danbooru_gallery/cache/offline/` 下，按 ComfyUI 用户和 D 站账号隔离，不保存账号密钥。不自动淘汰历史或离线缩略图；可在“离线缓存管理”查看占用并确认清空，或单独删除历史，仅清理不再被其他历史引用的数据。
 - 已有代理缩略图按 URL 复用；过去只在内存中的帖子列表不能自动补成完整历史。开启本功能后成功访问的页面才会建立可恢复记录。G 站维持原有行为。
 - 页面保留已加载图片的顺序和占位；远离视口的未选中卡片释放图片及交互内容，滚回时恢复，不删除前面的浏览记录。浏览器刷新及 ComfyUI 重启不会删除历史。
 
 需要重启 ComfyUI 并刷新浏览器加载本功能。当前实现只完成静态语法检查，未执行断网、重启、长时间滚动或真实 API 联调验收。
+
+### 本地收藏夹 / Local favorites
+
+D站画廊的爱心按钮将图片资料和缩略图保存在 ComfyUI 服务端，Danbooru 与 Gelbooru 分别管理，无需线上账号。点击“本地收藏夹”可独立搜索，退出后恢复在线搜索。新收藏夹从空列表开始，不导入或修改线上收藏。
+
+收藏库位于 `py/danbooru_gallery/data/local_favorites.sqlite`，不受缓存清理影响。停止 ComfyUI 后复制此数据库即可备份。原图仍按需联网加载；资料未完整保存时显示“补全资料”，断网仍可保留收藏并使用已有标签和缩略图。收藏内支持标签、排除标签、分级及日期筛选；默认最近收藏在前，不支持 `order:rank` 等线上专用搜索语法。
+
+Favorites are stored on the ComfyUI server, independently of website accounts and browser storage, with separate lists for each site. Saved metadata and thumbnails survive cache cleanup. Originals require an online fetch. Existing online favorites are neither imported nor modified.

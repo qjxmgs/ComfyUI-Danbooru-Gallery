@@ -13,6 +13,7 @@ const logger = createLogger('danbooru_gallery');
 loggerClient.setConsoleOutput(true);
 
 const galleryQueuePreparers = new Map();
+const favoriteEvents = new EventTarget();
 let galleryQueueChain = Promise.resolve();
 
 app.registerExtension({
@@ -191,7 +192,7 @@ app.registerExtension({
                         suggestions: [
                             "稍等一会儿再试，避免连续刷新触发限流。",
                             "确认浏览器或代理可以打开对应站点。",
-                            "如果在用收藏功能，检查 User ID/API Key 是否正确。",
+                            "如果在线浏览受限，检查站点凭据是否正确。",
                         ],
                         tip: "看不懂也没关系，把详情复制给 AI 问问，它会帮你翻译成大白话。",
                         details: {
@@ -356,21 +357,27 @@ app.registerExtension({
                 let offlineHistory = "";
                 let offlineHistoryQuery = "";
                 let offlineRetry = false;
-                let offlineFavoritesLoaded = false;
                 let offlineMessage = null;
                 let offlineModeSelect = null;
                 const usingLocal = () => (uiSettings.source_site || "danbooru") === "danbooru" && (offlineMode === "local" || offlinePaused || offlineSearch || Boolean(offlineHistory));
                 const offlineNotice = (message) => { if (offlineMessage) offlineMessage.textContent = message; };
                 const requireOnlineMedia = (post) => {
                     if (post.source_site !== "gelbooru" && usingLocal()) {
-                        showToast("原图和在线收藏需要联网；离线仍可编辑、复制提示词。", "info");
+                        showToast("原图需要联网；离线仍可收藏、编辑和复制提示词。", "info");
                         return false;
                     }
                     return true;
                 };
                 let filterState = { startTime: null, endTime: null, startPage: null };
                 let userAuth = { username: "", api_key: "", has_auth: false, gelbooru_user_id: "", gelbooru_api_key: "", gelbooru_has_auth: false }; // 用户认证信息
-                let userFavorites = []; // 用户收藏列表，确保字符串
+                let userFavorites = [];
+                let favoritesMode = false;
+                let favoritesLoadGeneration = 0;
+                const favoriteViews = new Map();
+                const onlineViews = new Map();
+                const saveViewSetting = (key, value) => {
+                    if (!favoritesMode) saveToLocalStorage(key, value);
+                };
                 let networkStatus = { connected: true, lastChecked: 0, lastError: null }; // 网络状态跟踪
                 let activePostsController = null;
                 let postsRequestGeneration = 0;
@@ -414,7 +421,7 @@ app.registerExtension({
                         });
                         const data = await response.json();
                         if (data.success) {
-                            if ((userAuth.username || '') !== username) {
+                            if (!favoritesMode && (userAuth.username || '') !== username) {
                                 activePostsController?.abort();
                                 postsRequestGeneration++;
                                 isLoading = false;
@@ -423,7 +430,7 @@ app.registerExtension({
                                 Object.keys(originalPostCache).forEach(key => delete originalPostCache[key]);
                                 temporaryTagEdits = {};
                                 seenPostIds.clear();
-                                offlineHistory = ''; offlineSearch = false; offlineFavoritesLoaded = false;
+                                offlineHistory = ''; offlineSearch = false;
                                 userFavorites = [];
                                 selectionWidget.value = '{}';
                                 const response = await fetch('/danbooru_gallery/offline/status');
@@ -460,17 +467,6 @@ app.registerExtension({
                 };
 
                 const currentSource = () => uiSettings.source_site || "danbooru";
-                const hasFavoriteAuth = () => (
-                    currentSource() === "gelbooru"
-                        ? Boolean(userAuth.gelbooru_has_auth)
-                        : Boolean(userAuth.has_auth)
-                );
-                const currentFavoriteTag = () => (
-                    currentSource() === "gelbooru"
-                        ? `fav:${userAuth.gelbooru_user_id || ""}`
-                        : `ordfav:${userAuth.username || ""}`
-                );
-
                 const getToastLevel = (type) => {
                     // 将toast类型映射到全局toast管理器的等级
                     const levelMap = {
@@ -482,208 +478,83 @@ app.registerExtension({
                     return levelMap[type] || 'info';
                 };
 
-                // 收藏管理功能
-                const addToFavorites = async (postId, button = null) => {
-                    if (!hasFavoriteAuth()) {
-                        showToast(t('authRequired'), 'warning');
-                        return { success: false, error: t('authRequired') };
-                    }
-
-                    // 显示加载状态
-                    if (button) {
-                        button.disabled = true;
-                        const originalHTML = button.innerHTML;
-                        button.innerHTML = '<div class="spinner"></div>';
-                        button.dataset.originalHTML = originalHTML;
-                    }
-
-                    try {
-                        const response = await fetch('/danbooru_gallery/favorites/add', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify({ post_id: postId, source: currentSource() })
-                        });
-                        const data = await response.json();
-
-                        // 恢复按钮状态
-                        if (button) {
-                            button.disabled = false;
-                            if (data.success || data.message === "已收藏，无需重复操作") {
-                                button.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="#DC3545" stroke="#DC3545" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path>
-                                </svg>`;
-                                button.title = t('unfavorite');
-                                button.classList.add('favorited');
-                                if (!userFavorites.includes(String(postId))) {
-                                    userFavorites.push(String(postId));
-                                }
-                                // 显示收藏成功提示
-                                showToast(t('favorite') + '成功', 'success', button);
-                            } else {
-                                button.innerHTML = button.dataset.originalHTML || originalHTML;
-                            }
-                            delete button.dataset.originalHTML;
-                        }
-
-                        if (!data.success) {
-                            const rawError = String(data.error || "");
-                            let errorMsg = formatGalleryError(data, "未知错误").summary;
-                            if (rawError.includes("网络错误")) {
-                                showError(data);
-                            } else if (rawError.includes("认证") || rawError.includes("401")) {
-                                errorMsg = `${errorMsg}\n\n${t('authRequired')}`;
-                                if (confirm(errorMsg + "\n\n是否打开设置？")) {
-                                    showSettingsDialog();
-                                }
-                            } else if (rawError.includes("Rate Limited") || rawError.includes("429")) {
-                                showError(data);
-                            } else {
-                                showError(data);
-                            }
-                        }
-
-                        return data;
-                    } catch (e) {
-                        logger.warn("添加收藏失败:", e);
-                        showError({
-                            error: `网络错误 - 无法连接到${currentSource() === "gelbooru" ? "Gelbooru" : "Danbooru"}服务器`,
-                            error_info: {
-                                title: "收藏请求失败",
-                                summary: `网络错误 - 无法连接到${currentSource() === "gelbooru" ? "Gelbooru" : "Danbooru"}服务器`,
-                                causes: ["浏览器请求 ComfyUI 后端失败，或 ComfyUI 后端无法访问目标站点。"],
-                                suggestions: ["确认 ComfyUI 后端仍在运行。", "检查网络、代理和防火墙。"],
-                                tip: "看不懂也没关系，把详情复制给 AI 问问，它会帮你翻译成大白话。",
-                                details: { raw_exception: `${e.name || "Error"}: ${e.message || e}` },
-                            },
-                        });
-                        if (button) {
-                            button.disabled = false;
-                            button.innerHTML = button.dataset.originalHTML || '<svg>...</svg>';  // 恢复
-                            delete button.dataset.originalHTML;
-                        }
-                        return { success: false, error: "网络错误" };
-                    }
+                const favoriteIcon = (active) => `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="${active ? '#DC3545' : 'none'}" stroke="${active ? '#DC3545' : 'currentColor'}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>`;
+                const paintFavoriteButtons = () => {
+                    imageGrid.querySelectorAll('.danbooru-favorite-button').forEach(button => {
+                        const active = userFavorites.includes(button.dataset.postId);
+                        button.classList.toggle('favorited', active);
+                        button.title = t(active ? 'unfavorite' : 'favorite');
+                        if (!button.disabled) button.innerHTML = favoriteIcon(active);
+                    });
                 };
-
-                const removeFromFavorites = async (postId, button = null) => {
-                    if (!hasFavoriteAuth()) {
-                        showToast(t('authRequired'), 'warning');
-                        return { success: false, error: t('authRequired') };
-                    }
-
-                    // 显示加载状态
-                    if (button) {
-                        button.disabled = true;
-                        const originalHTML = button.innerHTML;
-                        button.innerHTML = '<div class="spinner"></div>';
-                        button.dataset.originalHTML = originalHTML;
-                    }
-
-                    try {
-                        const response = await fetch('/danbooru_gallery/favorites/remove', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify({ post_id: postId, source: currentSource() })
-                        });
-                        let data;
-                        if (response.status === 204) {
-                            // 204 No Content 表示成功，但没有响应体
-                            data = { success: true, message: "取消收藏成功" };
-                        } else {
-                            data = await response.json();
-                        }
-
-                        // 恢复按钮状态
-                        if (button) {
-                            button.disabled = false;
-                            if (data.success) {
-                                button.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path>
-                                </svg>`;
-                                button.title = t('favorite');
-                                button.classList.remove('favorited');
-                                const index = userFavorites.indexOf(String(postId));
-                                if (index > -1) {
-                                    userFavorites.splice(index, 1);
-                                }
-                                // 显示取消收藏成功提示
-                                showToast(t('unfavorite') + '成功', 'success', button);
-                            } else {
-                                button.innerHTML = button.dataset.originalHTML || originalHTML;
-                            }
-                            delete button.dataset.originalHTML;
-                        }
-
-                        if (!data.success) {
-                            const rawError = String(data.error || "");
-                            let errorMsg = formatGalleryError(data, "未知错误").summary;
-                            if (rawError.includes("网络错误")) {
-                                showError(data);
-                            } else if (rawError.includes("认证") || rawError.includes("401")) {
-                                errorMsg = `${errorMsg}\n\n${t('authRequired')}`;
-                                if (confirm(errorMsg + "\n\n是否打开设置？")) {
-                                    showSettingsDialog();
-                                }
-                            } else if (rawError.includes("Rate Limited") || rawError.includes("429")) {
-                                showError(data);
-                            } else {
-                                showError(data);
-                            }
-                        }
-
-                        return data;
-                    } catch (e) {
-                        logger.warn("移除收藏失败:", e);
-                        showError({
-                            error: `网络错误 - 无法连接到${currentSource() === "gelbooru" ? "Gelbooru" : "Danbooru"}服务器`,
-                            error_info: {
-                                title: "取消收藏请求失败",
-                                summary: `网络错误 - 无法连接到${currentSource() === "gelbooru" ? "Gelbooru" : "Danbooru"}服务器`,
-                                causes: ["浏览器请求 ComfyUI 后端失败，或 ComfyUI 后端无法访问目标站点。"],
-                                suggestions: ["确认 ComfyUI 后端仍在运行。", "检查网络、代理和防火墙。"],
-                                tip: "看不懂也没关系，把详情复制给 AI 问问，它会帮你翻译成大白话。",
-                                details: { raw_exception: `${e.name || "Error"}: ${e.message || e}` },
-                            },
-                        });
-                        if (button) {
-                            button.disabled = false;
-                            button.innerHTML = button.dataset.originalHTML || '<svg>...</svg>';
-                            delete button.dataset.originalHTML;
-                        }
-                        return { success: false, error: "网络错误" };
-                    }
-                };
-
                 const loadFavorites = async (source = currentSource()) => {
-                    const requestedSource = source;
+                    const generation = ++favoritesLoadGeneration;
                     try {
-                        if (requestedSource === 'danbooru' && usingLocal()) return;
-                        const response = await fetch(`/danbooru_gallery/favorites?source=${encodeURIComponent(requestedSource)}`);
+                        const response = await fetch(`/danbooru_gallery/favorites?source=${encodeURIComponent(source)}`);
                         const data = await response.json();
-                        // A rapid source switch can leave an older request in flight.
-                        // Never let that response replace the new source's favorites.
-                        if (requestedSource !== currentSource()) return userFavorites;
-                        if (!data.success) {
-                            const errorMsg = data.error || "收藏列表读取失败";
-                            logger.warn("加载收藏列表失败:", errorMsg);
-                            if (hasFavoriteAuth()) {
-                                showToast(errorMsg, "warning");
-                            }
-                            userFavorites = [];
-                            return userFavorites;
-                        }
-                        userFavorites = (data.favorites || []).map(id => String(id));
+                        if (generation !== favoritesLoadGeneration || source !== currentSource()) return;
+                        if (!response.ok || !data.success) throw new Error(data.error || t('favoritesReadFailed'));
+                        userFavorites = (data.favorites || []).map(String);
+                        paintFavoriteButtons();
                         return userFavorites;
-                    } catch (e) {
-                        logger.warn("加载收藏列表失败:", e);
-                        userFavorites = [];
-                        return userFavorites;
+                    } catch (error) {
+                        if (generation === favoritesLoadGeneration && source === currentSource()) showToast(error.message, 'warning');
                     }
                 };
+                const retryFavorite = async (post, notify = true) => {
+                    const source = post.source_site || currentSource();
+                    try {
+                        const response = await fetch('/danbooru_gallery/favorites/retry', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ source, post_id: post.id }),
+                        });
+                        const data = await response.json();
+                        if (!response.ok || !data.success) throw new Error(data.error || t('favoritesWriteFailed'));
+                        if (data.post) {
+                            favoriteEvents.dispatchEvent(new CustomEvent('change', { detail: { source, updated: data.post } }));
+                            if (notify && data.post._favorite_incomplete) showToast(t('favoriteIncomplete'), 'warning');
+                        }
+                    } catch (error) {
+                        if (notify) showToast(error.message, 'warning');
+                    }
+                };
+                const changeFavorite = async (post, button) => {
+                    const source = post.source_site || currentSource();
+                    const remove = Boolean(post._local_favorite) || userFavorites.includes(String(post.id));
+                    button.disabled = true;
+                    button.innerHTML = '<div class="spinner"></div>';
+                    ++favoritesLoadGeneration;
+                    try {
+                        const response = await fetch(`/danbooru_gallery/favorites/${remove ? 'remove' : 'add'}`, {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ source, post_id: post.id, post }),
+                        });
+                        const data = await response.json();
+                        if (!response.ok || !data.success) throw new Error(data.error || t('favoritesWriteFailed'));
+                        if (source === currentSource()) {
+                            userFavorites = userFavorites.filter(id => id !== String(post.id));
+                            if (!remove && data.post) userFavorites.push(String(post.id));
+                        }
+                        favoriteEvents.dispatchEvent(new CustomEvent('change', { detail: { source } }));
+                        if (!remove && data.post?._favorite_incomplete) {
+                            showToast(t('favoriteIncomplete'), 'info');
+                            if (!(source === 'danbooru' && usingLocal())) void retryFavorite(data.post, false);
+                        }
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    } finally {
+                        button.disabled = false;
+                        paintFavoriteButtons();
+                    }
+                };
+                const onFavoriteChange = async (event) => {
+                    if (event.detail.source !== currentSource()) return;
+                    await loadFavorites();
+                    if (event.detail.source !== currentSource()) return;
+                    if (favoritesMode) void fetchAndRender(true, 1);
+                };
+                favoriteEvents.addEventListener('change', onFavoriteChange);
+                this._galleryFavoriteCleanup = () => favoriteEvents.removeEventListener('change', onFavoriteChange);
 
                 // 语言管理功能
                 const loadLanguage = async () => {
@@ -717,7 +588,7 @@ app.registerExtension({
                 // 更新界面文本
                 const updateInterfaceTexts = () => {
                     // 更新搜索框
-                    searchInput.placeholder = t('searchPlaceholder');
+                    searchInput.placeholder = t(favoritesMode ? 'favoriteSearchPlaceholder' : 'searchPlaceholder');
 
                     // 更新按钮文本和提示
                     const categoryButton = categoryDropdown.querySelector('.danbooru-category-button');
@@ -832,10 +703,7 @@ app.registerExtension({
                 const updateSourceState = () => {
                     const selectedSource = uiSettings.source_site || "danbooru";
                     sourceSelect.value = selectedSource;
-                    const favoritesDisabled = false;
-                    favoritesButton.disabled = favoritesDisabled;
-                    favoritesButton.style.opacity = favoritesDisabled ? "0.45" : "";
-                    favoritesButton.title = favoritesDisabled ? t('sourceFavoritesUnsupported') : t('favorites');
+                    favoritesButton.title = t('favorites');
                     displayAllSiteContentToggle.style.display = selectedSource === "gelbooru" ? "inline-flex" : "none";
                     const displayAllInput = displayAllSiteContentToggle.querySelector("input");
                     if (displayAllInput) {
@@ -942,7 +810,7 @@ app.registerExtension({
                             const checked = allCheckbox.checked;
                             ratingCheckboxes.forEach(cb => { cb.checked = checked; });
                             updateRatingButtonLabel();
-                            saveToLocalStorage('ratingValues', checked ? [...RATING_VALUES] : []);
+                            saveViewSetting('ratingValues', checked ? [...RATING_VALUES] : []);
                             ratingSelect.dispatchEvent(new Event('change'));
                         });
                     }
@@ -954,7 +822,7 @@ app.registerExtension({
                                 allCheckbox.checked = selectedRatings.length === RATING_VALUES.length;
                             }
                             updateRatingButtonLabel();
-                            saveToLocalStorage('ratingValues', selectedRatings);
+                            saveViewSetting('ratingValues', selectedRatings);
                             ratingSelect.dispatchEvent(new Event('change'));
                         });
                     });
@@ -1023,7 +891,10 @@ app.registerExtension({
                 ]);
 
                 sourceSelect.addEventListener('change', () => {
+                    (favoritesMode ? favoriteViews : onlineViews).set(currentSource(), captureGalleryView());
                     uiSettings.source_site = sourceSelect.value;
+                    userFavorites = [];
+                    ++favoritesLoadGeneration;
                     saveToLocalStorage('sourceSite', uiSettings.source_site);
                     updateSourceState();
                     searchAutocomplete.source = uiSettings.source_site;
@@ -1040,9 +911,14 @@ app.registerExtension({
                     Object.keys(originalPostCache).forEach(key => delete originalPostCache[key]);
                     temporaryTagEdits = {};
                     updateSelectionData();
+                    const savedFavoriteView = favoritesMode ? favoriteViews.get(currentSource()) : null;
+                    if (favoritesMode) {
+                        applyGalleryView(savedFavoriteView);
+                        updateFavoritesButtonState();
+                    }
                     // Rendering is the critical path. Persistence and favorites
                     // refresh are independent and must not delay the first grid.
-                    fetchAndRender(true);
+                    fetchAndRender(true, savedFavoriteView?.page || null);
                     void Promise.allSettled([
                         saveUiSettings({ ...uiSettings }),
                         loadFavorites(uiSettings.source_site),
@@ -1959,7 +1835,7 @@ app.registerExtension({
                                 const authResult = await saveUserAuth(newUsername, newApiKey, newGelbooruUserId, newGelbooruApiKey);
                                 authSuccess = authResult.success;
                                 if (authSuccess) {
-                                    await loadFavorites(); // 登录成功后重新加载收藏夹
+                                    await loadFavorites();
                                 } else {
                                     showToast(authResult.error || "保存认证信息失败", 'error');
                                     return;
@@ -2335,8 +2211,8 @@ app.registerExtension({
                         textContent: t('reset'),
                         onclick: () => {
                             filterState = { startTime: null, endTime: null, startPage: null };
-                            saveToLocalStorage('filterData', filterState);
-                            filterWidget.value = JSON.stringify(filterState);
+                            saveViewSetting('filterData', filterState);
+                            if (!favoritesMode) filterWidget.value = JSON.stringify(filterState);
                             filterButton.classList.remove('active');
                             dialog.remove();
                             fetchAndRender(true);
@@ -2368,8 +2244,8 @@ app.registerExtension({
                                 filterState.startPage = isNaN(startPage) ? null : startPage;
                             }
 
-                            saveToLocalStorage('filterData', filterState);
-                            filterWidget.value = JSON.stringify(filterState);
+                            saveViewSetting('filterData', filterState);
+                            if (!favoritesMode) filterWidget.value = JSON.stringify(filterState);
 
                             if (filterState.startTime || filterState.endTime || filterState.startPage) {
                                 filterButton.classList.add('active');
@@ -2661,6 +2537,7 @@ app.registerExtension({
                     requireTags: true,
                     requireMedia: true,
                     requireExactTags: true,
+                    requireOriginal: true,
                 });
 
                 const hydrateGelbooruPost = async (postData, requirements = {}) => {
@@ -2669,7 +2546,7 @@ app.registerExtension({
                         requireMedia: requirements.requireMedia !== false,
                         requireExactTags: Boolean(requirements.requireExactTags),
                     };
-                    if (!postData || postData.source_site !== "gelbooru" || hydrationRequirementsMet(postData, normalizedRequirements)) {
+                    if (!postData || (postData._local_favorite && !requirements.requireOriginal) || postData.source_site !== "gelbooru" || hydrationRequirementsMet(postData, normalizedRequirements)) {
                         if (postData) logger.debug(`[hydrateGelbooruPost] 跳过: id=${postData.id} tags=${hasCategorizedTags(postData)} exact=${hasExactCategorizedTags(postData)} media=${isUsableOriginalUrl(postData, postData?.file_url)}`);
                         return postData;
                     }
@@ -2709,7 +2586,7 @@ app.registerExtension({
                     requireExactTags: false,
                 });
                 const hydrateGelbooruEditPost = async (postData) => {
-                    if (!postData || postData.source_site !== "gelbooru" || temporaryTagEdits[postData.id]) {
+                    if (!postData || postData._local_favorite || postData.source_site !== "gelbooru" || temporaryTagEdits[postData.id]) {
                         return temporaryTagEdits[postData?.id] || postData;
                     }
 
@@ -2756,6 +2633,7 @@ app.registerExtension({
                 };
 
                 const enqueueGelbooruPrefetch = (postData) => {
+                    if (favoritesMode || postData?._local_favorite) return;
                     if (!postData || postData.source_site !== "gelbooru" || document.hidden) return;
                     if (navigator.connection?.saveData) return;
                     const requirements = { requireTags: true, requireMedia: true, requireExactTags: true };
@@ -2772,6 +2650,7 @@ app.registerExtension({
                 };
 
                 const observeGelbooruPrefetch = (element, postData) => {
+                    if (favoritesMode || postData?._local_favorite) return;
                     if (!element || postData?.source_site !== "gelbooru" || typeof IntersectionObserver === "undefined") return;
                     if (!gelbooruPrefetchObserver) {
                         gelbooruPrefetchObserver = new IntersectionObserver((entries) => {
@@ -2959,7 +2838,7 @@ app.registerExtension({
                     const requestPage = currentPage;
 
                     // 网络检查
-                    const isNetworkConnected = (uiSettings.source_site || "danbooru") === "danbooru" ? true : await checkNetworkStatus();
+                    const isNetworkConnected = favoritesMode || (uiSettings.source_site || "danbooru") === "danbooru" ? true : await checkNetworkStatus();
                     if (requestGeneration !== postsRequestGeneration) return;
                     if (!isNetworkConnected) {
                         console.log("网络错误已隐藏: 网络连接失败 - 无法连接到Danbooru服务器，请检查网络连接");
@@ -2991,15 +2870,15 @@ app.registerExtension({
                         // 按当前来源/去重模式的实际 tag 配额给提示，避免静默截断
                         const _src = uiSettings.source_site || "danbooru";
                         const _dedup = uiSettings.gelbooru_dedup_mode || "off";
-                        if (_src === "gelbooru" && _dedup === "on" && tagCount > 1) {
+                        if (!favoritesMode && _src === "gelbooru" && _dedup === "on" && tagCount > 1) {
                             showTagHint('开启去重时仅支持 1 个 tag（游标占用名额），其余 tag 将被忽略；如需多 tag 请配置密钥后选“开启·已配密钥”', false);
-                        } else if (tagCount > 2 && _src === 'gelbooru') {
+                        } else if (!favoritesMode && tagCount > 2 && _src === 'gelbooru') {
                             showTagHint('搜索只考虑前两个tag，第三个及后续tag将被忽略', false);
                         } else {
                             clearTagHint();
                         }
 
-                        let apiFormattedTags = convertTagsToApiFormat(searchValue);
+                        let apiFormattedTags = favoritesMode ? searchValue.replace(/\\([()])/g, '$1') : convertTagsToApiFormat(searchValue);
 
                         // 添加日期筛选
                         if (filterState.startTime || filterState.endTime) {
@@ -3016,7 +2895,7 @@ app.registerExtension({
                         const loadLimit = POSTS_PER_PAGE; // 1 页/次
                         // 游标分页：D站始终用游标；G站仅当 dedup 非 off 时。
                         // G站游标续拉必须回到 pid=0，否则从高页跳转后会叠加页偏移。
-                        const useCursor = src === "danbooru" || (src === "gelbooru" && dedup !== "off");
+                        const useCursor = !favoritesMode && (src === "danbooru" || (src === "gelbooru" && dedup !== "off"));
                         const hasCursor = useCursor && !offlineSearch && !offlineHistory && Boolean(lastPostId);
                         const gelbooruCursorMode = src === "gelbooru" && dedup !== "off";
                         const apiPage = gelbooruCursorMode && hasCursor ? 1 : requestPage;
@@ -3038,8 +2917,8 @@ app.registerExtension({
                             logger.info(`[fetchAndRender] 无游标: useCursor=${useCursor} lastPostId=${lastPostId}`);
                         }
 
-                        let endpoint = '/danbooru_gallery/posts';
-                        if (src === 'danbooru') {
+                        let endpoint = favoritesMode ? '/danbooru_gallery/favorites/posts' : '/danbooru_gallery/posts';
+                        if (!favoritesMode && src === 'danbooru') {
                             if (offlineHistory && searchInput.value !== offlineHistoryQuery) offlineHistory = "";
                             if (offlineHistory) params.set('history', offlineHistory);
                             if (offlineRetry) { params.set('retry', '1'); offlineRetry = false; }
@@ -3054,7 +2933,12 @@ app.registerExtension({
                         logger.info(`[fetchAndRender] 响应: status=${response.status}`);
                         const rawText = await response.text();
                         if (requestGeneration !== postsRequestGeneration) return;
-                        if (src === 'danbooru') {
+                        if (!response.ok && favoritesMode) {
+                            let detail;
+                            try { detail = JSON.parse(rawText).error; } catch {}
+                            throw new Error(detail || t('favoritesReadFailed'));
+                        }
+                        if (!favoritesMode && src === 'danbooru') {
                             const origin = response.headers.get('X-Gallery-Source');
                             if (origin === 'history') {
                                 offlinePaused = true;
@@ -3074,10 +2958,6 @@ app.registerExtension({
                             if (origin === 'online') {
                                 offlinePaused = false;
                                 offlineNotice("在线浏览 · 已保存页面，缩略图正在后台补齐");
-                                if (!offlineFavoritesLoaded && hasFavoriteAuth()) {
-                                    offlineFavoritesLoaded = true;
-                                    void loadFavorites('danbooru');
-                                }
                             } else if (origin === 'search') {
                                 offlineNotice("本地搜索结果 · 仅包含已缓存图片");
                             } else if (origin === 'history') {
@@ -3097,6 +2977,7 @@ app.registerExtension({
                             newPosts = [];
                         }
                         if (!Array.isArray(newPosts)) newPosts = [];
+                        if (favoritesMode && newPosts.length < loadLimit) endOfResults = true;
 
                         if (parseFailed) {
                             const parseError = {
@@ -3217,6 +3098,12 @@ app.registerExtension({
                             return;
                         }
                         logger.error(`[fetchAndRender] 异常: ${e.message}`);
+                        if (favoritesMode) {
+                            parseFailed = true;
+                            endOfResults = true;
+                            showToast(e.message, 'error');
+                            return;
+                        }
                         if ((uiSettings.source_site || "danbooru") === "danbooru") {
                             parseFailed = true;
                             endOfResults = true;
@@ -3275,7 +3162,7 @@ app.registerExtension({
                 };
 
                 const maybeLoadMore = () => {
-                    if (usingLocal()) return;
+                    if (!favoritesMode && usingLocal()) return;
                     if (isLoading || endOfResults) {
                         logger.warn(`[maybeLoadMore] 跳过: isLoading=${isLoading} endOfResults=${endOfResults}`);
                         return;
@@ -3299,7 +3186,7 @@ app.registerExtension({
 
                 // 2 秒定时轮询检查前方缓冲，不够就自动补货
                 this._galleryLoadTimer = setInterval(() => {
-                    if (!container.isConnected || usingLocal()) return;
+                    if (!container.isConnected || (!favoritesMode && usingLocal())) return;
                     const viewport = imageGrid.getBoundingClientRect();
                     let retries = 0;
                     for (const card of imageGrid.children) {
@@ -3660,7 +3547,7 @@ app.registerExtension({
                                 showToast(t('resetTags') + '成功', 'success', resetTagsButton);
                             } else {
                                 // 如果缓存中没有原始数据，尝试从服务器获取一次
-                                const fetchedOriginalPost = await fetchOriginalPost(post.id);
+                                const fetchedOriginalPost = post._local_favorite ? post : await fetchOriginalPost(post.id);
                                 if (fetchedOriginalPost) {
                                     originalPostCache[post.id] = JSON.parse(JSON.stringify(fetchedOriginalPost)); // 缓存获取到的数据
                                     // 再次调用自身，以使用缓存中的数据进行重置
@@ -4222,7 +4109,7 @@ app.registerExtension({
                         return wrapper;
                     }
 
-                    if (!post.id || (post.source_site === 'gelbooru' && !post.preview_file_url)) return null;
+                    if (!post.id || (!post._local_favorite && post.source_site === 'gelbooru' && !post.preview_file_url)) return null;
 
                     const wrapper = $el("div.danbooru-image-wrapper");
                     wrapper._galleryPost = post;
@@ -4256,9 +4143,9 @@ app.registerExtension({
                         ? post.preview_file_url
                         : `${post.preview_file_url}?v=${post.md5}`;
 
-                    const thumbnailUrl = post.source_site === 'gelbooru'
+                    const thumbnailUrl = post._favorite_thumbnail_url || (post.source_site === 'gelbooru'
                         ? `/danbooru_gallery/image_proxy?thumbnail=1&url=${encodeURIComponent(previewUrl)}`
-                        : `/danbooru_gallery/offline/thumbnail?url=${encodeURIComponent(post.preview_file_url)}`;
+                        : `/danbooru_gallery/offline/thumbnail?url=${encodeURIComponent(post.preview_file_url)}`);
                     let thumbnailAttempts = 0;
                     let thumbnailRetryAt = 0;
                     let thumbnailLoading = false;
@@ -4275,14 +4162,14 @@ app.registerExtension({
                     const retryThumbnailButton = $el('button', {
                         type: 'button', textContent: '重试缩略图',
                         onpointerdown: (event) => event.stopPropagation(),
-                        onclick: (event) => { event.stopPropagation(); retryThumbnail(); },
+                        onclick: (event) => { event.stopPropagation(); if (post._local_favorite) void retryFavorite(post); else retryThumbnail(); },
                     });
                     const thumbnailPlaceholder = $el('div.danbooru-thumbnail-placeholder', {
                         style: { display: 'none' },
                         onclick: (event) => { event.stopPropagation(); img.click(); },
                     }, [thumbnailStatus, retryThumbnailButton]);
                     wrapper._retryThumbnailIfVisible = (viewport) => {
-                        if (!thumbnailRetryAt || thumbnailLoading || thumbnailAttempts >= 3 || Date.now() < thumbnailRetryAt) return false;
+                        if (post._local_favorite || !thumbnailRetryAt || thumbnailLoading || thumbnailAttempts >= 3 || Date.now() < thumbnailRetryAt) return false;
                         const bounds = wrapper.getBoundingClientRect();
                         if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) return false;
                         retryThumbnail();
@@ -4302,13 +4189,13 @@ app.registerExtension({
                             scheduleResizeGrid();
                         },
                         onerror: (evt) => {
-                            if (post.source_site !== 'gelbooru') {
+                            if (post._local_favorite || post.source_site !== 'gelbooru') {
                                 thumbnailLoading = false;
                                 thumbnailRetryAt = Date.now() + 5000 * (2 ** thumbnailAttempts);
                                 img.style.visibility = 'hidden';
                                 img.style.aspectRatio = `${post.image_width || 1} / ${post.image_height || 1}`;
                                 thumbnailPlaceholder.style.display = 'flex';
-                                thumbnailStatus.textContent = usingLocal()
+                                thumbnailStatus.textContent = post._local_favorite ? t('favoriteIncomplete') : usingLocal()
                                     ? '本地暂无缩略图；可在设置 → 离线管理中重试联网。'
                                     : '缩略图暂未加载，标签仍可使用';
                                 retryThumbnailButton.disabled = false;
@@ -4606,54 +4493,16 @@ app.registerExtension({
                         globalTooltip.style.top = `${newTop + window.scrollY}px`;
                     });
 
-                    // 总是创建收藏按钮，无论用户是否登录
-                    const currentSearch = searchInput.value.trim();
-                    const postFavoriteTag = currentFavoriteTag();
-                    const inFavoritesMode = hasFavoriteAuth() && postFavoriteTag && currentSearch.includes(postFavoriteTag);
-                    const isFavorited = inFavoritesMode || userFavorites.includes(String(post.id));
+                    const isFavorited = Boolean(post._local_favorite) || userFavorites.includes(String(post.id));
                     const favoriteButton = $el("button.danbooru-favorite-button", {
-                        "data-post-id": post.id,
-                        innerHTML: isFavorited ?
-                            `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="#DC3545" stroke="#DC3545" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path>
-                            </svg>` :
-                            `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path>
-                            </svg>`,
-                        title: isFavorited ? t('unfavorite') : t('favorite'),
+                        "data-post-id": String(post.id),
+                        innerHTML: favoriteIcon(isFavorited),
+                        title: t(isFavorited ? 'unfavorite' : 'favorite'),
                         className: isFavorited ? 'favorited' : '',
-                        onclick: async (e) => {
-                            e.stopPropagation();
-                            if (!requireOnlineMedia(post)) return; // 阻止事件冒泡，避免触发图片选择
-
-                            // 如果用户未登录，提示登录
-                            if (!hasFavoriteAuth()) {
-                                showToast(t('authRequired'), 'warning');
-                                return;
-                            }
-
-                            // 在操作收藏前验证用户名和API Key的有效性
-
-                            const currentlyFavorited = userFavorites.includes(String(post.id)) || inFavoritesMode;
-                            let result;
-
-                            if (currentlyFavorited) {
-                                // 取消收藏
-                                result = await removeFromFavorites(post.id, favoriteButton);
-                                if (result.success) {
-                                    // 如果在收藏夹视图中，直接移除元素
-                                    const currentSearch = searchInput.value.trim();
-                                    if (postFavoriteTag && currentSearch.includes(postFavoriteTag)) {
-                                        wrapper.remove();
-                                    }
-                                }
-                            } else {
-                                // 添加收藏
-                                result = await addToFavorites(post.id, favoriteButton);
-                            }
-
-                            // 错误已在函数内处理
-                        }
+                        onclick: async (event) => {
+                            event.stopPropagation();
+                            await changeFavorite(post, favoriteButton);
+                        },
                     });
 
                     // 创建按钮容器
@@ -4693,6 +4542,7 @@ app.registerExtension({
                             const hydratedPost = await hydrateGelbooruPost(post, {
                                 requireTags: false,
                                 requireMedia: true,
+                                requireOriginal: true,
                             });
                             const mediaPost = getPostWithOriginalMedia(hydratedPost);
                             const imageUrl = getBestImageUrl(mediaPost, false);
@@ -4706,6 +4556,18 @@ app.registerExtension({
                     buttonsContainer.appendChild(editButton);
                     buttonsContainer.appendChild(downloadButton);
                     buttonsContainer.appendChild(favoriteButton);
+                    if (post._favorite_incomplete) {
+                        wrapper.appendChild($el('span.danbooru-favorite-incomplete', { textContent: t('favoritePending'), title: t('favoriteIncomplete') }));
+                        buttonsContainer.appendChild($el('button.danbooru-favorite-retry', {
+                            textContent: '↻', title: `${t('favoriteRetry')} · ${t('favoriteIncomplete')}`,
+                            onclick: async (event) => {
+                                event.stopPropagation();
+                                event.currentTarget.disabled = true;
+                                const button = event.currentTarget;
+                                try { await retryFavorite(post); } finally { button.disabled = false; }
+                            },
+                        }));
+                    }
 
                     wrapper.appendChild(img);
                     wrapper.appendChild(thumbnailPlaceholder);
@@ -4808,7 +4670,7 @@ app.registerExtension({
 
                 searchInput.addEventListener("keydown", (e) => {
                     if (e.key === "Enter") {
-                        saveToLocalStorage('searchValue', searchInput.value.trim());
+                        saveViewSetting('searchValue', searchInput.value.trim());
                         fetchAndRender(true);
                     }
                 });
@@ -4859,36 +4721,42 @@ app.registerExtension({
                     }
 
                     // 刷新图像
-                    saveToLocalStorage('searchValue', searchInput.value);
+                    saveViewSetting('searchValue', searchInput.value);
                     fetchAndRender(true);
                 });
 
                 // 监听搜索框变化，更新排行榜按钮状态
                 // 更新收藏夹按钮状态
+                const captureGalleryView = () => ({
+                    search: searchInput.value, ratings: getSelectedRatings(), filter: { ...filterState },
+                    page: currentVisiblePage, offlineHistory, offlineHistoryQuery, offlineSearch,
+                });
+                const applyGalleryView = (view) => {
+                    searchInput.value = view?.search || '';
+                    previousSearchValue = searchInput.value;
+                    applySelectedRatings(view?.ratings || RATING_VALUES);
+                    filterState = { ...(view?.filter || { startTime: null, endTime: null, startPage: null }) };
+                    if (!favoritesMode) filterWidget.value = JSON.stringify(filterState);
+                    filterButton.classList.toggle('active', Boolean(filterState.startTime || filterState.endTime || filterState.startPage));
+                    offlineHistory = view?.offlineHistory || '';
+                    offlineHistoryQuery = view?.offlineHistoryQuery || '';
+                    offlineSearch = view?.offlineSearch || false;
+                    updateRankingButtonState();
+                    clearTagHint();
+                    const clearButton = searchContainer.querySelector('.danbooru-clear-search-button');
+                    if (clearButton) clearButton.style.display = searchInput.value ? 'block' : 'none';
+                };
                 const updateFavoritesButtonState = () => {
-                    // 始终显示收藏夹按钮
-                    favoritesButton.style.display = 'flex';
-
-                    if (!hasFavoriteAuth()) {
-                        favoritesButton.classList.remove('active');
-                        return;
-                    }
-
-                    const currentValue = searchInput.value.trim();
-                    const favTag = currentFavoriteTag();
-                    const hasFavs = Boolean(favTag) && currentValue.includes(favTag);
-                    if (hasFavs) {
-                        favoritesButton.classList.add('active');
-                    } else {
-                        favoritesButton.classList.remove('active');
-                    }
+                    favoritesButton.classList.toggle('active', favoritesMode);
+                    rankingButton.disabled = favoritesMode;
+                    searchInput.placeholder = t(favoritesMode ? 'favoriteSearchPlaceholder' : 'searchPlaceholder');
                 };
 
                 // 统一的搜索框输入处理函数
                 const handleSearchInput = () => {
                     const currentValue = searchInput.value.trim();
                     if (previousSearchValue !== "" && currentValue === "") {
-                        saveToLocalStorage('searchValue', '');
+                        saveViewSetting('searchValue', '');
                         fetchAndRender(true); // 清空搜索框时自动刷新
                     }
                     previousSearchValue = currentValue;
@@ -4905,42 +4773,17 @@ app.registerExtension({
 
                 // 收藏夹按钮点击事件
                 favoritesButton.addEventListener("click", async () => {
-                    if (!hasFavoriteAuth()) {
-                        showToast(t('authRequired'), 'warning');
-                        return;
-                    }
-
-
-                    const favTag = currentFavoriteTag();
-                    if (!favTag) {
-                        showToast(t('authRequired'), 'warning');
-                        return;
-                    }
-                    const currentValue = searchInput.value.trim();
-                    const hasFavs = currentValue.includes(favTag);
-
-                    if (hasFavs) {
-                        // 移除收藏夹标签，并清理残留的逗号
-                        let newValue = currentValue.replace(new RegExp(`\\s*${favTag}\\s*`), '');
-                        // 清理多余的逗号和空格
-                        newValue = newValue.replace(/,\s*,/g, ',').replace(/,\s*$/g, '').replace(/^\s*,/g, '').replace(/\s+/g, ' ').trim();
-                        searchInput.value = newValue;
-                    } else {
-                        let newValue;
-                        if (currentValue) {
-                            // 如果前面已经有内容，用逗号分隔，但检查末尾是否已有逗号（后面可能有空格）
-                            const hasTrailingComma = /\s*,\s*$/.test(currentValue);
-                            const separator = hasTrailingComma ? ' ' : ', ';
-                            newValue = `${currentValue}${separator}${favTag}`;
-                        } else {
-                            newValue = favTag;
-                        }
-                        searchInput.value = newValue;
-                        // 进入收藏夹模式时，不需要手动加载收藏列表，因为 fetchAndRender 会获取
-                    }
+                    const source = currentSource();
+                    (favoritesMode ? favoriteViews : onlineViews).set(source, captureGalleryView());
+                    favoritesMode = !favoritesMode;
+                    const view = (favoritesMode ? favoriteViews : onlineViews).get(source);
+                    applyGalleryView(view);
                     updateFavoritesButtonState();
-                    saveToLocalStorage('searchValue', searchInput.value);
-                    fetchAndRender(true);
+                    updateOfflineVisibility();
+                    searchAutocomplete.querySequence++;
+                    searchAutocomplete.hide();
+                    void loadFavorites(source);
+                    void fetchAndRender(true, view?.page || 1);
                 });
 
                 refreshButton.addEventListener("click", () => {
@@ -5103,7 +4946,7 @@ app.registerExtension({
                         offlinePaused = false; offlineSearch = false; offlineHistory = ''; offlineRetry = true;
                         await fetchAndRender(true, currentVisiblePage);
                     }), offlineMessage);
-                const updateOfflineVisibility = () => { offlineBar.style.display = sourceSelect.value === 'gelbooru' ? 'none' : 'flex'; };
+                const updateOfflineVisibility = () => { offlineBar.style.display = favoritesMode || sourceSelect.value === 'gelbooru' ? 'none' : 'flex'; };
                 sourceSelect.addEventListener('change', updateOfflineVisibility);
 
                 container.appendChild($el("div.danbooru-controls", [searchContainer, sourceSelect, displayAllSiteContentToggle, rankingButton, favoritesButton, ratingSelect, categoryDropdown, formattingDropdown, filterButton, clearSelectionButton, settingsButton, refreshButton]));
@@ -5129,9 +4972,14 @@ app.registerExtension({
                     },
                     onSelect: (tag) => {
                         // 选择建议后保存
-                        saveToLocalStorage('searchValue', searchInput.value);
+                        saveViewSetting('searchValue', searchInput.value);
                     }
                 });
+                const fetchOnlineSuggestions = searchAutocomplete.fetchSuggestions.bind(searchAutocomplete);
+                searchAutocomplete.fetchSuggestions = (query) => {
+                    if (favoritesMode) { searchAutocomplete.hide(); return; }
+                    return fetchOnlineSuggestions(query);
+                };
                 container.appendChild(imageGrid);
 
                 // 创建底部状态栏容器
@@ -5284,10 +5132,6 @@ app.registerExtension({
                         await loadUserAuth();
 
 
-                        if (networkConnected && (uiSettings.source_site || "danbooru") === "gelbooru" && hasFavoriteAuth()) {
-                            await loadFavorites();
-                        }
-
                         // 更新界面文本
                         updateInterfaceTexts();
 
@@ -5311,6 +5155,7 @@ app.registerExtension({
                         }
                         updateSourceState();
                         searchAutocomplete.source = uiSettings.source_site || "danbooru";
+                        await loadFavorites();
 
                         // 从 localStorage 加载并覆盖筛选状态
                         const savedSearch = loadFromLocalStorage('searchValue', null);
@@ -5325,7 +5170,7 @@ app.registerExtension({
                             const savedRating = loadFromLocalStorage('ratingValue', null);
                             if (savedRating && RATING_VALUES.includes(savedRating)) {
                                 applySelectedRatings([savedRating]);
-                                saveToLocalStorage('ratingValues', [savedRating]);
+                                saveViewSetting('ratingValues', [savedRating]);
                             } else {
                                 applySelectedRatings(RATING_VALUES);
                             }
@@ -5356,7 +5201,7 @@ app.registerExtension({
                         const savedFilterData = loadFromLocalStorage('filterData', null);
                         if (savedFilterData) {
                             filterState = savedFilterData;
-                            filterWidget.value = JSON.stringify(filterState);
+                            if (!favoritesMode) filterWidget.value = JSON.stringify(filterState);
                         }
 
                         // 恢复已存储的 preload/dedup/globalLogging（在 loadUiSettings 之后）
@@ -5481,6 +5326,7 @@ app.registerExtension({
             nodeType.prototype.onRemoved = function () {
                 clearInterval(this._galleryLoadTimer);
                 this._galleryViewportCleanup?.();
+                this._galleryFavoriteCleanup?.();
                 galleryQueuePreparers.delete(this);
                 // 移除所有可能由该节点创建的全局UI元素
                 const elementsToRemove = document.querySelectorAll(
@@ -6059,7 +5905,9 @@ $el("style", {
         cursor: pointer;
         display: block;
     }
-    .danbooru-status { text-align: center; width: 100%; margin: 10px 0; color: #ccc; }
+    .danbooru-ranking-button:disabled { opacity: 0.45; cursor: default; }
+    .danbooru-favorite-incomplete { position: absolute; bottom: 8px; left: 6px; z-index: 14; padding: 3px 6px; border-radius: 4px; background: #553d16; color: #ffe3a2; font-size: 10px; pointer-events: none; }
+    .danbooru-status { grid-column: 1 / -1; grid-row: span 8; min-height: 24px; text-align: center; width: 100%; margin: 10px 0; color: #ccc; }
     .danbooru-status.error { color: #f55; }
     
         /* New Tooltip Styles */

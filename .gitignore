@@ -124,3 +124,6 @@ CLAUDE.md
 # Independent translation dictionary
 py/shared/data/tag.sqlite
 py/shared/data/dictionary-*.sqlite
+
+# Durable local gallery favorites (not disposable cache)
+py/danbooru_gallery/data/local_favorites.sqlite*
