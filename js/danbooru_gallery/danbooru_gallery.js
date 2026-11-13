@@ -2029,7 +2029,7 @@ app.registerExtension({
                                 const filteredPosts = posts.filter(post => !isPostFiltered(post));
                                 imageGrid.innerHTML = "";
                                 filteredPosts.forEach(post => renderPost(post));
-                                // posts 必须与 imageGrid 子节点同序一一对应(recycleOldItems 的不变式)，
+                                // 重绘时保持 posts 与卡片顺序一致，
                                 // 重渲染只保留 filteredPosts，故同步回写 posts，避免回收时前缀错位
                                 posts.length = 0;
                                 posts.push(...filteredPosts);
@@ -3190,8 +3190,7 @@ app.registerExtension({
                         filteredPosts.forEach(post => renderPost(post, requestPage));
                         logger.info(`[fetchAndRender] 渲染${filteredPosts.length}张, 总posts=${posts.length}`);
 
-                        // 渲染后回收最老端，维持滑动窗口(浏览多少回收多少)
-                        recycleOldItems();
+                        // Offscreen cards are virtualized without removing session data or grid positions.
 
                         // 去重陷阱检测：仅当启用 seenPostIds 过滤时启用（非纯翻页模式）
                         const isDedupOff = src === "gelbooru" && dedup === "off";
@@ -3301,6 +3300,11 @@ app.registerExtension({
                 // 2 秒定时轮询检查前方缓冲，不够就自动补货
                 this._galleryLoadTimer = setInterval(() => {
                     if (!container.isConnected || usingLocal()) return;
+                    const viewport = imageGrid.getBoundingClientRect();
+                    let retries = 0;
+                    for (const card of imageGrid.children) {
+                        if (card._retryThumbnailIfVisible?.(viewport) && ++retries >= 2) break;
+                    }
                     logger.debug(`[setInterval] tick`);
                     maybeLoadMore();
                 }, 2000);
@@ -3314,7 +3318,7 @@ app.registerExtension({
                         const updates = [];
                         Array.from(imageGrid.children).forEach((wrapper) => {
                             const img = wrapper.querySelector('img');
-                            if ((img && img.clientHeight > 0) || wrapper.classList.contains('danbooru-error-wrapper')) {
+                            if ((img && img.clientHeight > 0) || wrapper.dataset.virtual === '1' || wrapper.classList.contains('danbooru-error-wrapper')) {
                                 const spans = Math.ceil((wrapper.offsetHeight + rowGap) / (rowHeight + rowGap));
                                 updates.push([wrapper, `span ${spans}`]);
                             }
@@ -3363,51 +3367,59 @@ app.registerExtension({
                     });
                 };
 
-                // Recycle old unselected cards; disk history remains available for backward navigation.
-                const MAX_KEPT_ITEMS = 240; // Keep a bounded window of recent cards.
-                const recycleOldItems = () => {
-                    try {
-                        const children = imageGrid.children;
-                        const overflow = children.length - MAX_KEPT_ITEMS;
-                        if (overflow <= 0) return;
-
-                        // 记录回收前、当前视口顶端那个元素的位置，用于事后补偿滚动
-                        const gridTop = imageGrid.getBoundingClientRect().top;
-                        let anchorEl = null, anchorOffset = 0;
-                        for (const c of children) {
-                            const r = c.getBoundingClientRect();
-                            if (r.bottom - gridTop > 0) { // 第一个底边进入视口的元素
-                                anchorEl = c;
-                                anchorOffset = r.top - gridTop; // 相对网格顶端的偏移
-                                break;
+                // Keep the session order and grid positions; only unload offscreen card contents.
+                const viewportObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        const card = entry.target;
+                        if (card.parentElement !== imageGrid) {
+                            viewportObserver.unobserve(card);
+                            continue;
+                        }
+                        const post = card._galleryPost;
+                        if (!post || post.error) continue;
+                        if (entry.isIntersecting && card.dataset.virtual === '1') {
+                            const restored = createPostElement(post, Number(card.dataset.galleryPage));
+                            if (restored) {
+                                restored.style.gridRowEnd = card.style.gridRowEnd;
+                                const img = restored.querySelector('img');
+                                if (img) img.style.aspectRatio = card.style.aspectRatio;
+                                card.replaceWith(restored);
                             }
+                        } else if (!entry.isIntersecting && card.dataset.virtual !== '1' && !card.classList.contains('selected')) {
+                            const img = card.querySelector('img');
+                            const width = img?.naturalWidth || post.image_width || 1;
+                            const height = img?.naturalHeight || post.image_height || 1;
+                            const placeholder = $el('div.danbooru-image-wrapper');
+                            placeholder.dataset.virtual = '1';
+                            placeholder.dataset.postId = card.dataset.postId;
+                            placeholder.dataset.galleryPage = card.dataset.galleryPage;
+                            placeholder._galleryPost = post;
+                            placeholder.style.gridRowEnd = card.style.gridRowEnd;
+                            placeholder.style.aspectRatio = `${width} / ${height}`;
+                            placeholder.style.pointerEvents = 'none';
+                            gelbooruPrefetchObserver?.unobserve(card);
+                            viewportObserver.unobserve(card);
+                            card.replaceWith(placeholder);
+                            if (!temporaryTagEdits[post.id]) delete originalPostCache[post.id];
                         }
-
-                        let removed = 0;
-                        // Stop at the viewport anchor; skip selected cards without blocking recycling.
-                        for (const el of Array.from(children)) {
-                            if (removed >= overflow || el === anchorEl) break;
-                            if (!el.classList.contains('danbooru-image-wrapper') || el.classList.contains('selected')) continue;
-                            const index = posts.indexOf(el._galleryPost);
-                            if (index >= 0) posts.splice(index, 1);
-                            delete originalPostCache[el.dataset.postId];
-                            delete temporaryTagEdits[el.dataset.postId];
-                            gelbooruPrefetchObserver?.unobserve(el);
-                            el.remove();
-                            removed++;
-                        }
-                        if (removed <= 0) return;
-
-
-                        // 补偿滚动位置：回收后用锚点重新定位，避免视口跳动
-                        if (anchorEl && anchorEl.isConnected) {
-                            const newTop = anchorEl.getBoundingClientRect().top - imageGrid.getBoundingClientRect().top;
-                            imageGrid.scrollTop += (newTop - anchorOffset);
-                        }
-                        logger.info(`[recycle] 回收${removed}张, 剩余DOM=${imageGrid.children.length} posts=${posts.length}`);
-                    } catch (e) {
-                        logger.warn(`[recycle] 回收异常: ${e?.message || e}`);
                     }
+                }, { root: imageGrid, rootMargin: '600px 0px' });
+                const cardMutationObserver = new MutationObserver((records) => {
+                    for (const record of records) {
+                        for (const card of record.removedNodes) {
+                            if (card.nodeType !== 1) continue;
+                            viewportObserver.unobserve(card);
+                            gelbooruPrefetchObserver?.unobserve(card);
+                        }
+                        for (const card of record.addedNodes) {
+                            if (card.nodeType === 1 && card._galleryPost && card.parentElement === imageGrid) viewportObserver.observe(card);
+                        }
+                    }
+                });
+                cardMutationObserver.observe(imageGrid, { childList: true });
+                this._galleryViewportCleanup = () => {
+                    viewportObserver.disconnect();
+                    cardMutationObserver.disconnect();
                 };
 
                 const showEditPanel = (post) => {
@@ -4247,19 +4259,59 @@ app.registerExtension({
                     const thumbnailUrl = post.source_site === 'gelbooru'
                         ? `/danbooru_gallery/image_proxy?thumbnail=1&url=${encodeURIComponent(previewUrl)}`
                         : `/danbooru_gallery/offline/thumbnail?url=${encodeURIComponent(post.preview_file_url)}`;
+                    let thumbnailAttempts = 0;
+                    let thumbnailRetryAt = 0;
+                    let thumbnailLoading = false;
+                    const retryThumbnail = () => {
+                        if (thumbnailLoading || !wrapper.isConnected) return;
+                        thumbnailLoading = true;
+                        thumbnailAttempts++;
+                        retryThumbnailButton.disabled = true;
+                        thumbnailStatus.textContent = usingLocal()
+                            ? '正在检查本地缓存…' : '正在重试缩略图…';
+                        img.src = `${thumbnailUrl}&retry=${Date.now()}`;
+                    };
+                    const thumbnailStatus = $el('span', { textContent: '缩略图暂未加载' });
+                    const retryThumbnailButton = $el('button', {
+                        type: 'button', textContent: '重试缩略图',
+                        onpointerdown: (event) => event.stopPropagation(),
+                        onclick: (event) => { event.stopPropagation(); retryThumbnail(); },
+                    });
+                    const thumbnailPlaceholder = $el('div.danbooru-thumbnail-placeholder', {
+                        style: { display: 'none' },
+                        onclick: (event) => { event.stopPropagation(); img.click(); },
+                    }, [thumbnailStatus, retryThumbnailButton]);
+                    wrapper._retryThumbnailIfVisible = (viewport) => {
+                        if (!thumbnailRetryAt || thumbnailLoading || thumbnailAttempts >= 3 || Date.now() < thumbnailRetryAt) return false;
+                        const bounds = wrapper.getBoundingClientRect();
+                        if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) return false;
+                        retryThumbnail();
+                        return true;
+                    };
                     const img = $el("img", {
                         src: thumbnailUrl,
                         loading: "lazy",
                         decoding: "async",
-                        onload: scheduleResizeGrid,
+                        onload: () => {
+                            thumbnailLoading = false;
+                            thumbnailRetryAt = 0;
+                            thumbnailPlaceholder.style.display = 'none';
+                            img.style.visibility = '';
+                            img.style.aspectRatio = '';
+                            retryThumbnailButton.disabled = false;
+                            scheduleResizeGrid();
+                        },
                         onerror: (evt) => {
                             if (post.source_site !== 'gelbooru') {
-                                img.onerror = null;
-                                img.removeAttribute('src');
-                                img.alt = '缩略图尚未缓存（标签仍可使用）';
+                                thumbnailLoading = false;
+                                thumbnailRetryAt = Date.now() + 5000 * (2 ** thumbnailAttempts);
+                                img.style.visibility = 'hidden';
                                 img.style.aspectRatio = `${post.image_width || 1} / ${post.image_height || 1}`;
-                                img.style.background = 'var(--comfy-input-bg)';
-                                img.title = '联网后点击刷新补齐缩略图';
+                                thumbnailPlaceholder.style.display = 'flex';
+                                thumbnailStatus.textContent = usingLocal()
+                                    ? '本地暂无缩略图；可在设置 → 离线管理中重试联网。'
+                                    : '缩略图暂未加载，标签仍可使用';
+                                retryThumbnailButton.disabled = false;
                                 scheduleResizeGrid();
                                 return;
                             }
@@ -4656,6 +4708,7 @@ app.registerExtension({
                     buttonsContainer.appendChild(favoriteButton);
 
                     wrapper.appendChild(img);
+                    wrapper.appendChild(thumbnailPlaceholder);
                     wrapper.appendChild(buttonsContainer);
                     wrapper.appendChild(copyPromptButton);
                     observeGelbooruPrefetch(wrapper, post);
@@ -4676,7 +4729,6 @@ app.registerExtension({
                 };
 
                 // 错误格：渲染的同时 push 进 posts，保持 posts 与 DOM 一一对应
-                // （回收逻辑 recycleOldItems 依赖此不变式，否则 splice 会错删真实 post）
                 let _errSeq = 0;
                 const errorCellsBySignature = new Map();
                 const getGalleryErrorSignature = (errObj) => {
@@ -5428,6 +5480,7 @@ app.registerExtension({
             const onRemoved = nodeType.prototype.onRemoved;
             nodeType.prototype.onRemoved = function () {
                 clearInterval(this._galleryLoadTimer);
+                this._galleryViewportCleanup?.();
                 galleryQueuePreparers.delete(this);
                 // 移除所有可能由该节点创建的全局UI元素
                 const elementsToRemove = document.querySelectorAll(
@@ -5918,6 +5971,30 @@ $el("style", {
         height: 16px;
     }
 
+    .danbooru-thumbnail-placeholder {
+        position: absolute;
+        inset: 0;
+        box-sizing: border-box;
+        padding: 8px 8px 42px;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+        background: var(--comfy-input-bg);
+        color: var(--comfy-input-text);
+        font-size: 11px;
+        text-align: center;
+        overflow: hidden;
+    }
+    .danbooru-thumbnail-placeholder button {
+        border: 1px solid #7B68EE;
+        border-radius: 5px;
+        padding: 5px 8px;
+        background: var(--comfy-menu-bg);
+        color: var(--comfy-input-text);
+        cursor: pointer;
+        font-size: 11px;
+    }
     .danbooru-copy-prompt-button:focus-visible {
         outline: 2px solid #7B68EE;
         outline-offset: 2px;
