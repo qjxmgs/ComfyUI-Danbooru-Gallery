@@ -3189,8 +3189,8 @@ app.registerExtension({
 
                         Array.from(imageGrid.children).forEach((wrapper) => {
                             const img = wrapper.querySelector('img');
-                            if (img && img.clientHeight > 0) {
-                                const spans = Math.ceil((img.clientHeight + rowGap) / (rowHeight + rowGap));
+                            if ((img && img.clientHeight > 0) || wrapper.classList.contains('danbooru-error-wrapper')) {
+                                const spans = Math.ceil((wrapper.offsetHeight + rowGap) / (rowHeight + rowGap));
                                 wrapper.style.gridRowEnd = `span ${spans}`;
                             }
                         });
@@ -3221,7 +3221,7 @@ app.registerExtension({
                     const cs = window.getComputedStyle(imageGrid);
                     const rowGap = parseInt(cs.gridRowGap) || parseInt(cs.rowGap) || 5;
                     const rowHeight = parseInt(cs.gridAutoRows) || 1;
-                    const renderedH = colW * (imgH / imgW);
+                    const renderedH = Math.max(0, colW - 4) * (imgH / imgW) + 4;
                     return Math.ceil((renderedH + rowGap) / (rowHeight + rowGap));
                 };
                 // Coalesce rapid onload calls (rate-limited loads fire 200ms apart; batching
@@ -4013,8 +4013,11 @@ app.registerExtension({
 
                     // error 占位格：红色边框，直接显示错误文本，占据一个图片格空间
                     if (post && post.error) {
+                        const gridStyle = window.getComputedStyle(imageGrid);
+                        const rowGap = parseFloat(gridStyle.rowGap) || 5;
+                        const rowHeight = parseFloat(gridStyle.gridAutoRows) || 1;
                         const wrapper = $el("div.danbooru-image-wrapper", {
-                            style: { border: '1px solid #ff6b6b', minHeight: '180px', display: 'flex', alignItems: 'stretch', justifyContent: 'stretch', color: '#ff6b6b', fontSize: '0.85em', padding: '8px', textAlign: 'left', background: 'var(--comfy-input-bg)', gridRowEnd: `span ${Math.ceil(180 / 10)}` }
+                            style: { border: '1px solid #ff6b6b', minHeight: '180px', display: 'flex', alignItems: 'stretch', justifyContent: 'stretch', color: '#ff6b6b', fontSize: '0.85em', padding: '8px', textAlign: 'left', background: 'var(--comfy-input-bg)', gridRowEnd: `span ${Math.ceil((198 + rowGap) / (rowHeight + rowGap))}` }
                         });
                         wrapper.classList.add("danbooru-error-wrapper");
                         wrapper.dataset.postId = `err_${post.pid || post.page || '?'}`;
@@ -5494,9 +5497,10 @@ $el("style", {
         border-color: #DC3545;
     }
     .danbooru-favorites-button .icon { width: 16px; height: 16px; }
-    .danbooru-image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); grid-gap: 5px; grid-auto-rows: 10px; overflow-y: auto; background-color: var(--comfy-input-bg); padding: 5px; border-radius: 4px; flex-grow: 1; height: 0; }
+    .danbooru-image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); grid-gap: 5px; grid-auto-rows: 1px; overflow-y: auto; background-color: var(--comfy-input-bg); padding: 5px; border-radius: 4px; flex-grow: 1; height: 0; }
     .danbooru-image-wrapper {
         grid-row-start: auto;
+        align-self: start;
         border: 2px solid transparent;
         transition: border-color 0.2s, transform 0.2s ease-out, box-shadow 0.2s ease-out;
         border-radius: 6px;
@@ -5582,9 +5586,9 @@ $el("style", {
     }
 
     .danbooru-copy-prompt-button {
-        position: absolute;
-        right: 3px;
-        bottom: 3px;
+        position: absolute !important;
+        right: 8px;
+        bottom: 8px;
         z-index: 15;
     }
 
@@ -5743,27 +5747,27 @@ $el("style", {
             font-weight: 400;
             opacity: 0.75;
         }
-        .danbooru-tooltip-tag.tag-category-general {
+        .danbooru-tooltip-tags-wrapper > .danbooru-tooltip-tag:nth-child(5n + 1) {
             --danbooru-tag-color: #9db8f4;
             --danbooru-tag-bg: #303746;
             --danbooru-tag-border: #788fb9;
         }
-        .danbooru-tooltip-tag.tag-category-artist {
+        .danbooru-tooltip-tags-wrapper > .danbooru-tooltip-tag:nth-child(5n + 2) {
             --danbooru-tag-color: #79d3e6;
             --danbooru-tag-bg: #293e43;
             --danbooru-tag-border: #5898a6;
         }
-        .danbooru-tooltip-tag.tag-category-character {
+        .danbooru-tooltip-tags-wrapper > .danbooru-tooltip-tag:nth-child(5n + 3) {
             --danbooru-tag-color: #81d7a5;
             --danbooru-tag-bg: #2d3e34;
             --danbooru-tag-border: #649d79;
         }
-        .danbooru-tooltip-tag.tag-category-copyright {
+        .danbooru-tooltip-tags-wrapper > .danbooru-tooltip-tag:nth-child(5n + 4) {
             --danbooru-tag-color: #c4a3ef;
             --danbooru-tag-bg: #3b3247;
             --danbooru-tag-border: #9374af;
         }
-        .danbooru-tooltip-tag.tag-category-meta {
+        .danbooru-tooltip-tags-wrapper > .danbooru-tooltip-tag:nth-child(5n + 5) {
             --danbooru-tag-color: #ed9fc5;
             --danbooru-tag-bg: #44313d;
             --danbooru-tag-border: #ae7693;
@@ -6209,15 +6213,19 @@ $el("style", {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 22px;
-        height: 22px;
-        border-radius: 50%;
+        box-sizing: border-box;
+        flex: 0 0 auto;
+        width: calc(2.25em + 14px);
+        height: calc(2.25em + 14px);
+        padding: 0;
+        border-radius: 6px;
         border: 1px dashed #888;
         color: #888;
         background-color: transparent;
         cursor: pointer;
-        font-size: 16px;
-        margin-left: 5px;
+        font-size: 0.8em;
+        line-height: 1.25;
+        margin: 0;
         transition: all 0.2s;
     }
     .danbooru-add-tag-button:hover {
