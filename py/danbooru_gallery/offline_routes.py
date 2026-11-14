@@ -1,11 +1,57 @@
 """Local-only storage endpoints and automatic Danbooru fallback."""
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import re
 from urllib.parse import urlparse
 from aiohttp import web
 from .offline_store import OfflineStore, fingerprint, query_spec
 from .thumbnail_cache import get_thumbnail, save_thumbnail
+
+
+class ThumbnailSlots:
+    """Two downloads, with at most one background transfer and foreground-first admission."""
+
+    def __init__(self):
+        self.condition = asyncio.Condition()
+        self.pending = {}
+        self.active = 0
+        self.background = 0
+        self.running = set()
+
+    async def promote(self, key):
+        await self.set_priority(key, False)
+
+    async def set_priority(self, key, background):
+        async with self.condition:
+            if key in self.pending:
+                self.pending[key] = background
+                self.condition.notify_all()
+
+    @asynccontextmanager
+    async def claim(self, key, background):
+        async with self.condition:
+            self.pending[key] = background
+            try:
+                await self.condition.wait_for(lambda: self.active < 2 and
+                    (not self.pending[key] or self.background == 0) and
+                    key == min(self.pending, key=self.pending.get))
+            except BaseException:
+                self.pending.pop(key, None)
+                self.condition.notify_all()
+                raise
+            background = self.pending.pop(key)
+            self.active += 1
+            self.background += int(background)
+            self.running.add(key)
+        try:
+            yield
+        finally:
+            async with self.condition:
+                self.active -= 1
+                self.background -= int(background)
+                self.running.discard(key)
+                self.condition.notify_all()
 
 
 class OfflineGallery:
@@ -21,7 +67,10 @@ class OfflineGallery:
         self.downloads = {}
         self.write_locks = {}
         self.revisions = {}
-        self.semaphore = asyncio.Semaphore(2)
+        self.slots = ThumbnailSlots()
+        self.foreground_downloads = set()
+        self.download_waiters = {}
+        self.foreground_waiters = {}
         routes = server.routes
         routes.get('/danbooru_gallery/offline/status')(self.status)
         routes.post('/danbooru_gallery/offline/mode')(self.set_mode)
@@ -75,14 +124,53 @@ class OfflineGallery:
             return
         self.jobs[key] = asyncio.create_task(self.fill(key, store))
 
-    async def fetch_thumbnail(self, key, store, url):
+    async def fetch_thumbnail(self, key, store, url, background=False, check_connected=None):
         job_key = (key, url)
+        self.download_waiters[job_key] = self.download_waiters.get(job_key, 0) + 1
+        if not background:
+            self.foreground_waiters[job_key] = self.foreground_waiters.get(job_key, 0) + 1
+            self.foreground_downloads.add(job_key)
         task = self.downloads.get(job_key)
         if task is None:
             task = asyncio.create_task(self._fetch_thumbnail(key, store, url))
             self.downloads[job_key] = task
-            task.add_done_callback(lambda done: self.downloads.pop(job_key, None))
-        return await asyncio.shield(task)
+            def finished(done):
+                if self.downloads.get(job_key) is done:
+                    self.downloads.pop(job_key, None)
+                # A disconnected browser still leaves a shielded transfer to finish caching.
+                if not done.cancelled():
+                    done.exception()
+            task.add_done_callback(finished)
+        try:
+            if not background:
+                await self.slots.promote(job_key)
+            if check_connected:
+                # ComfyUI's aiohttp runner does not cancel handlers on disconnect.
+                # Drop abandoned queued work; started thread downloads still finish caching.
+                while not task.done():
+                    if not check_connected():
+                        raise asyncio.CancelledError
+                    await asyncio.wait([task], timeout=0.25)
+            return await asyncio.shield(task)
+        finally:
+            remaining = self.download_waiters[job_key] - 1
+            if remaining:
+                self.download_waiters[job_key] = remaining
+            else:
+                self.download_waiters.pop(job_key, None)
+            if not background:
+                foreground = self.foreground_waiters[job_key] - 1
+                if foreground:
+                    self.foreground_waiters[job_key] = foreground
+                else:
+                    self.foreground_waiters.pop(job_key, None)
+                    self.foreground_downloads.discard(job_key)
+            if not remaining and job_key not in self.slots.running and not task.done():
+                if self.downloads.get(job_key) is task:
+                    self.downloads.pop(job_key, None)
+                task.cancel()
+            elif job_key not in self.foreground_downloads:
+                await self.slots.set_priority(job_key, True)
 
     async def _fetch_thumbnail(self, key, store, url):
         data = await asyncio.to_thread(store.thumbnail, url)
@@ -100,7 +188,8 @@ class OfflineGallery:
             host = (urlparse(url).hostname or '').lower()
             if urlparse(url).scheme not in ('http', 'https') or not (host == 'donmai.us' or host.endswith('.donmai.us')):
                 return None
-            async with self.semaphore:
+            job_key = (key, url)
+            async with self.slots.claim(job_key, job_key not in self.foreground_downloads):
                 if await self.is_local(key, store):
                     return None
                 response = await asyncio.to_thread(self.fetch, 'GET', url,
@@ -126,7 +215,7 @@ class OfflineGallery:
                 for offset in range(0, len(urls), 2):
                     if await self.is_local(key, store):
                         return
-                    results = await asyncio.gather(*(self.fetch_thumbnail(key, store, url) for url in urls[offset:offset+2]), return_exceptions=True)
+                    results = await asyncio.gather(*(self.fetch_thumbnail(key, store, url, background=True) for url in urls[offset:offset+2]), return_exceptions=True)
                     for url, result in zip(urls[offset:offset+2], results):
                         if isinstance(result, Exception) or result is None:
                             await asyncio.to_thread(store.thumbnail_failed, url)
@@ -241,7 +330,8 @@ class OfflineGallery:
                 await asyncio.to_thread(store.thumbnail, url, data)
             elif not await self.is_local(key, store):
                 try:
-                    data = await self.fetch_thumbnail(key, store, url)
+                    data = await self.fetch_thumbnail(key, store, url,
+                        check_connected=lambda: request.transport is not None and not request.transport.is_closing())
                 except Exception:
                     data = None
         if data is None:

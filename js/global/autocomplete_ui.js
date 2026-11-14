@@ -632,6 +632,8 @@ class AutocompleteUI {
      * 销毁
      */
     destroy() {
+        this.querySequence++;
+        this.isActive = false;
         // 清理DOM
         if (this.containerElement && this.containerElement.parentElement) {
             this.containerElement.remove();

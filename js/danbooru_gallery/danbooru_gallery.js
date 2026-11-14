@@ -1,5 +1,7 @@
 import { app } from "/scripts/app.js";
 import { $el } from "/scripts/ui.js";
+import { GalleryViewport } from "./gallery_viewport.js";
+import { galleryThumbnails } from "./gallery_thumbnails.js";
 import { globalAutocompleteCache } from "../global/autocomplete_cache.js";
 import { AutocompleteUI } from "../global/autocomplete_ui.js";
 import { toastManagerProxy } from "../global/toast_manager.js";
@@ -9,8 +11,7 @@ import { createLogger, loggerClient } from '../global/logger_client.js';
 
 // 创建logger实例
 const logger = createLogger('danbooru_gallery');
-// 打开全局日志，所有级别打到 ComfyUI 终端
-loggerClient.setConsoleOutput(true);
+
 
 const galleryQueuePreparers = new Map();
 const favoriteEvents = new EventTarget();
@@ -81,6 +82,31 @@ app.registerExtension({
 
                 // 保存节点实例引用
                 const nodeInstance = this;
+                const lifetime = new AbortController();
+                let disposed = false;
+                let initialized = false;
+                let hasCommittedView = false;
+                const timers = new Set();
+                const ownedElements = new Set();
+                const own = element => { ownedElements.add(element); return element; };
+                const removeOwned = element => {
+                    ownedElements.delete(element);
+                    element._dispose?.();
+                    element.remove();
+                };
+                const later = (callback, ms) => {
+                    const timer = setTimeout(() => { timers.delete(timer); if (!disposed) callback(); }, ms);
+                    timers.add(timer);
+                    return timer;
+                };
+                const cancelLater = timer => { clearTimeout(timer); timers.delete(timer); };
+                const fetch = (url, options = {}) => window.fetch(url, {
+                    ...options, signal: options.signal || lifetime.signal,
+                });
+                const selectedPosts = new Map();
+                const postKey = post => `${post.source_site || currentSource()}:${post.id}`;
+                const thumbnailStates = new Map();
+                const recycledCards = [];
 
                 // 存储每张图片的原始标签数据，用于重置和编辑状态判断
                 const originalPostCache = {};
@@ -246,14 +272,14 @@ app.registerExtension({
 
                     if (message?.error_info || persistent) {
                         if (errorDisplayTimer) {
-                            clearTimeout(errorDisplayTimer);
+                            cancelLater(errorDisplayTimer);
                             errorDisplayTimer = null;
                         }
                         errorDisplay.innerHTML = "";
                         errorDisplay.appendChild(buildGalleryErrorElement(message));
                         errorDisplay.style.display = "block";
                         if (!persistent) {
-                            errorDisplayTimer = setTimeout(() => {
+                            errorDisplayTimer = later(() => {
                                 errorDisplay.style.display = "none";
                                 errorDisplay.innerHTML = "";
                             }, 12000);
@@ -264,7 +290,7 @@ app.registerExtension({
                 // 清除错误信息的函数
                 const clearError = () => {
                     if (errorDisplayTimer) {
-                        clearTimeout(errorDisplayTimer);
+                        cancelLater(errorDisplayTimer);
                         errorDisplayTimer = null;
                     }
                     errorDisplay.innerHTML = "";
@@ -277,7 +303,7 @@ app.registerExtension({
                     tagHintDisplay.style.display = "block";
                     if (!persistent) {
                         // 3秒后自动隐藏
-                        setTimeout(() => {
+                        later(() => {
                             tagHintDisplay.style.display = "none";
                         }, 3000);
                     }
@@ -333,11 +359,12 @@ app.registerExtension({
 
 
                 // 确保在 widget 渲染后调整大小
-                setTimeout(() => {
+                later(() => {
                     this.onResize(this.size);
                 }, 10);
 
                 let globalTooltip, globalTooltipTimeout;
+                let tooltipSuppressedUntil = 0;
                 let currentTooltipId = 0; // 用于追踪当前活动的tooltip请求
                 const POSTS_PER_PAGE = 42;
                 let posts = [], currentPage = 1, isLoading = false, endOfResults = false; // currentPage 指向下一批逻辑页
@@ -426,12 +453,14 @@ app.registerExtension({
                                 postsRequestGeneration++;
                                 isLoading = false;
                                 posts = [];
-                                imageGrid.replaceChildren();
+                                clearGallery();
                                 Object.keys(originalPostCache).forEach(key => delete originalPostCache[key]);
                                 temporaryTagEdits = {};
                                 seenPostIds.clear();
                                 offlineHistory = ''; offlineSearch = false;
                                 userFavorites = [];
+                                selectedPosts.clear();
+                                galleryThumbnails.invalidate(`${offlineScope}:`);
                                 selectionWidget.value = '{}';
                                 const response = await fetch('/danbooru_gallery/offline/status');
                                 if (response.ok) {
@@ -548,7 +577,10 @@ app.registerExtension({
                     }
                 };
                 const onFavoriteChange = async (event) => {
-                    if (event.detail.source !== currentSource()) return;
+                    if (disposed || event.detail.source !== currentSource()) return;
+                    if (event.detail.updated?._favorite_thumbnail_url) {
+                        galleryThumbnails.invalidate(`${offlineScope}:${event.detail.source}:${event.detail.updated._favorite_thumbnail_url}`);
+                    }
                     await loadFavorites();
                     if (event.detail.source !== currentSource()) return;
                     if (favoritesMode) void fetchAndRender(true, 1);
@@ -903,13 +935,14 @@ app.registerExtension({
                     // trip, while the posts endpoint already reports failures.
                     networkStatus = { connected: true, lastChecked: Date.now(), lastError: null };
                     posts = [];
-                    imageGrid.replaceChildren();
+                    clearGallery();
                     offlineHistory = ""; offlineSearch = false;
                     seenPostIds.clear();
                     lastPostId = null;
                     logger.info(`[sourceChange] 源切换为${uiSettings.source_site}, seenPostIds清空, lastPostId清空`);
                     Object.keys(originalPostCache).forEach(key => delete originalPostCache[key]);
                     temporaryTagEdits = {};
+                    selectedPosts.clear();
                     updateSelectionData();
                     const savedFavoriteView = favoritesMode ? favoriteViews.get(currentSource()) : null;
                     if (favoritesMode) {
@@ -933,6 +966,7 @@ app.registerExtension({
                         posts = [];
                         Object.keys(originalPostCache).forEach(key => delete originalPostCache[key]);
                         temporaryTagEdits = {};
+                        selectedPosts.clear();
                         updateSelectionData();
                         fetchAndRender(true);
                     }
@@ -962,7 +996,7 @@ app.registerExtension({
                             button.classList.toggle("open");
                         }
                     });
-                });
+                }, { signal: lifetime.signal });
 
                 // 排行榜按钮
                 const rankingButton = $el("button.danbooru-ranking-button", {
@@ -1060,7 +1094,7 @@ app.registerExtension({
                                 }
 
                                 showToast(t('importSuccess'), 'success');
-                                dialog.remove();
+                                removeOwned(dialog);
 
                                 await initializeApp();
                                 showSettingsDialog();
@@ -1796,7 +1830,7 @@ app.registerExtension({
                             fontWeight: "500",
                             transition: "all 0.2s ease"
                         },
-                        onclick: () => dialog.remove()
+                        onclick: () => removeOwned(dialog)
                     });
 
                     const saveButton = $el("button", {
@@ -1898,12 +1932,12 @@ app.registerExtension({
                                 loggerClient.setConsoleOutput(newGlobalLogging);
                                 updateSelectionData();
 
-                                dialog.remove();
+                                removeOwned(dialog);
                                 showToast(t('saveSuccess'), 'success');
 
                                 // 重新过滤当前已加载的帖子
                                 const filteredPosts = posts.filter(post => !isPostFiltered(post));
-                                imageGrid.innerHTML = "";
+                                clearGallery();
                                 filteredPosts.forEach(post => renderPost(post));
                                 // 重绘时保持 posts 与卡片顺序一致，
                                 // 重渲染只保留 filteredPosts，故同步回写 posts，避免回收时前缀错位
@@ -1939,20 +1973,19 @@ app.registerExtension({
                     // 点击背景关闭对话框
                     dialog.addEventListener('click', (e) => {
                         if (e.target === dialog) {
-                            dialog.remove();
+                            removeOwned(dialog);
                         }
                     });
 
                     // ESC键关闭对话框
                     const escHandler = (e) => {
                         if (e.key === 'Escape') {
-                            dialog.remove();
-                            document.removeEventListener('keydown', escHandler);
+                            removeOwned(dialog);
                         }
                     };
-                    document.addEventListener('keydown', escHandler);
+                    dialog.addEventListener('keydown', escHandler);
 
-                    document.body.appendChild(dialog);
+                    document.body.appendChild(own(dialog));
                     blacklistTextarea.focus();
 
                     // Add event listeners after all elements are defined
@@ -1980,7 +2013,7 @@ app.registerExtension({
                             if (success) {
                                 globalMultiLanguageManager.setLanguage(lang);
                                 updateInterfaceTexts(); // Update main UI
-                                dialog.remove(); // Close current dialog
+                                removeOwned(dialog); // Close current dialog
                                 showSettingsDialog(currentState); // Re-open with new language and preserved state
                             } else {
                                 showToast('Failed to save language setting.', 'error');
@@ -2023,6 +2056,15 @@ app.registerExtension({
 
 
                 const imageGrid = $el("div.danbooru-image-grid");
+                let viewport;
+                const clearGallery = () => {
+                    viewport.clear();
+                    for (const child of [...imageGrid.children]) if (child !== viewport.content) child.remove();
+                };
+                const showGridStatus = text => {
+                    clearGallery();
+                    imageGrid.append($el('p.danbooru-status', { textContent: text }));
+                };
 
                 // 创建筛选对话框
                 const showFilterDialog = () => {
@@ -2039,7 +2081,7 @@ app.registerExtension({
                             alignItems: "center",
                             justifyContent: "center"
                         },
-                        onclick: (e) => { if (e.target === dialog) dialog.remove(); }
+                        onclick: (e) => { if (e.target === dialog) removeOwned(dialog); }
                     });
 
                     const content = $el("div.danbooru-settings-dialog-content", {
@@ -2185,7 +2227,7 @@ app.registerExtension({
                                     }
 
                                     // Use a timeout to allow the browser to apply styles before we log them
-                                    setTimeout(() => {
+                                    later(() => {
                                         if (indicator) {
                                         }
                                     }, 0);
@@ -2204,7 +2246,7 @@ app.registerExtension({
 
                     const cancelButton = $el("button.danbooru-dialog-button--secondary", {
                         textContent: t('cancel'),
-                        onclick: () => dialog.remove()
+                        onclick: () => removeOwned(dialog)
                     });
 
                     const resetButton = $el("button.danbooru-dialog-button--secondary", {
@@ -2214,7 +2256,7 @@ app.registerExtension({
                             saveViewSetting('filterData', filterState);
                             if (!favoritesMode) filterWidget.value = JSON.stringify(filterState);
                             filterButton.classList.remove('active');
-                            dialog.remove();
+                            removeOwned(dialog);
                             fetchAndRender(true);
                         }
                     });
@@ -2253,7 +2295,7 @@ app.registerExtension({
                                 filterButton.classList.remove('active');
                             }
 
-                            dialog.remove();
+                            removeOwned(dialog);
                             fetchAndRender(true);
                         }
                     });
@@ -2614,7 +2656,7 @@ app.registerExtension({
                     if (!item) return;
                     gelbooruPrefetchActive++;
                     try {
-                        await new Promise(resolve => setTimeout(resolve, GELBOORU_PREFETCH_DELAY_MS));
+                        await new Promise(resolve => later(resolve, GELBOORU_PREFETCH_DELAY_MS));
                         if (item.generation !== gelbooruPrefetchGeneration || document.hidden) return;
                         await hydrateGelbooruPost(item.post, {
                             requireTags: true,
@@ -2774,10 +2816,11 @@ app.registerExtension({
                 let currentTags = ""; // 追踪当前搜索条件，用于决定是否重置游标（搜索条件变化时清空 lastPostId）
 
                 const fetchAndRender = async (reset = false, startPageOverride = null) => {
-                    logger.info(`[fetchAndRender] called reset=${reset} startPageOverride=${startPageOverride} isLoading=${isLoading} endOfResults=${endOfResults}`);
+                    if (disposed) return;
+                    logger.debug(`[fetchAndRender] called reset=${reset} startPageOverride=${startPageOverride} isLoading=${isLoading} endOfResults=${endOfResults}`);
                     if (isLoading) {
                         if (!reset) {
-                            logger.warn(`[fetchAndRender] 跳过: isLoading=true`);
+                            logger.debug(`[fetchAndRender] 跳过: isLoading=true`);
                             return;
                         }
                         // A reset (especially a source switch) supersedes the old
@@ -2785,11 +2828,11 @@ app.registerExtension({
                         activePostsController?.abort();
                     }
                     if (endOfResults && !reset) {
-                        logger.warn(`[fetchAndRender] 跳过: endOfResults=true`);
+                        logger.debug(`[fetchAndRender] 跳过: endOfResults=true`);
                         return;
                     }
                     const previousView = reset ? {
-                        posts, children: Array.from(imageGrid.children).filter(el => !el.classList.contains('danbooru-loading')),
+                        posts,
                         page: currentPage, visible: currentVisiblePage, windowStart: pageWindowStart,
                         cursor: lastPostId, tags: currentTags, seen: new Set(seenPostIds), scroll: imageGrid.scrollTop,
                     } : null;
@@ -2798,7 +2841,7 @@ app.registerExtension({
                     const requestController = new AbortController();
                     activePostsController = requestController;
                     isLoading = true;
-                    logger.info(`[fetchAndRender] isLoading=置true 开始加载`);
+                    logger.debug(`[fetchAndRender] isLoading=置true 开始加载`);
                     refreshButton.classList.add("loading");
                     refreshButton.disabled = true;
                     updatePaginationControls();
@@ -2815,9 +2858,9 @@ app.registerExtension({
                         currentVisiblePage = requestedStartPage;
                         pageWindowStart = requestedStartPage;
                         const newTags = searchInput.value.trim();
-                        logger.info(`[fetchAndRender] reset: tags="${newTags}" currentTags="${currentTags}"`);
+                        logger.debug(`[fetchAndRender] reset: tags="${newTags}" currentTags="${currentTags}"`);
                         if (newTags !== currentTags) {
-                            logger.info(`[fetchAndRender] 标签变化, 清空seenPostIds和lastPostId`);
+                            logger.debug(`[fetchAndRender] 标签变化, 清空seenPostIds和lastPostId`);
                             lastPostId = null;
                             seenPostIds.clear();
                         }
@@ -2830,7 +2873,7 @@ app.registerExtension({
                         // seenPostIds残留旧ID导致新结果全被过滤, 总是"未找到结果"
                         lastPostId = null;
                         seenPostIds.clear();
-                        logger.info(`[fetchAndRender] reset完成: posts清空, endOfResults=置false, seenPostIds清空`);
+                        logger.debug(`[fetchAndRender] reset完成: posts清空, endOfResults=置false, seenPostIds清空`);
                         // Keep previous cards visible until the replacement response is available.
                         updatePaginationControls();
                     }
@@ -2844,9 +2887,16 @@ app.registerExtension({
                         console.log("网络错误已隐藏: 网络连接失败 - 无法连接到Danbooru服务器，请检查网络连接");
                         const networkError = networkStatus.lastError || { error: "网络连接失败" };
                         endOfResults = true;
-                        if (reset) {
-                            imageGrid.innerHTML = "";
-                            renderErrorCell(networkError, requestPage);
+                        if (reset && previousView.posts.length) {
+                            posts = previousView.posts;
+                            currentPage = previousView.page;
+                            currentVisiblePage = previousView.visible;
+                            pageWindowStart = previousView.windowStart;
+                            currentTags = previousView.tags;
+                            lastPostId = previousView.cursor;
+                            seenPostIds.clear();
+                            previousView.seen.forEach(id => seenPostIds.add(id));
+                            showToast('页面加载失败，已保留当前内容', 'warning');
                         } else {
                             renderErrorCell(networkError, requestPage);
                         }
@@ -2899,7 +2949,7 @@ app.registerExtension({
                         const hasCursor = useCursor && !offlineSearch && !offlineHistory && Boolean(lastPostId);
                         const gelbooruCursorMode = src === "gelbooru" && dedup !== "off";
                         const apiPage = gelbooruCursorMode && hasCursor ? 1 : requestPage;
-                        logger.info(`[fetchAndRender] API参数: src=${src} dedup=${dedup} logicalPage=${requestPage} apiPage=${apiPage} limit=${loadLimit} before_id=${lastPostId} reset=${reset}`);
+                        logger.debug(`[fetchAndRender] API参数: src=${src} dedup=${dedup} logicalPage=${requestPage} apiPage=${apiPage} limit=${loadLimit} before_id=${lastPostId} reset=${reset}`);
                         const params = new URLSearchParams({
                             "source": src,
                             "gelbooru_display_all_site_content": uiSettings.gelbooru_display_all_site_content ? "1" : "0",
@@ -2912,9 +2962,9 @@ app.registerExtension({
 
                         if (hasCursor) {
                             params.set("before_id", lastPostId);
-                            logger.info(`[fetchAndRender] 游标模式: before_id=${lastPostId}`);
+                            logger.debug(`[fetchAndRender] 游标模式: before_id=${lastPostId}`);
                         } else {
-                            logger.info(`[fetchAndRender] 无游标: useCursor=${useCursor} lastPostId=${lastPostId}`);
+                            logger.debug(`[fetchAndRender] 无游标: useCursor=${useCursor} lastPostId=${lastPostId}`);
                         }
 
                         let endpoint = favoritesMode ? '/danbooru_gallery/favorites/posts' : '/danbooru_gallery/posts';
@@ -2930,7 +2980,7 @@ app.registerExtension({
                         const response = await fetch(`${endpoint}?${params}`, {
                             signal: requestController.signal,
                         });
-                        logger.info(`[fetchAndRender] 响应: status=${response.status}`);
+                        logger.debug(`[fetchAndRender] 响应: status=${response.status}`);
                         const rawText = await response.text();
                         if (requestGeneration !== postsRequestGeneration) return;
                         if (!response.ok && favoritesMode) {
@@ -2972,7 +3022,7 @@ app.registerExtension({
                         try {
                             newPosts = JSON.parse(rawText);
                         } catch (parseErr) {
-                            logger.warn(`[fetchAndRender] 响应解析失败(status=${response.status})，本次跳过:`, parseErr?.message || parseErr);
+                            logger.debug(`[fetchAndRender] 响应解析失败(status=${response.status})，本次跳过:`, parseErr?.message || parseErr);
                             parseFailed = true;
                             newPosts = [];
                         }
@@ -2980,6 +3030,7 @@ app.registerExtension({
                         if (favoritesMode && newPosts.length < loadLimit) endOfResults = true;
 
                         if (parseFailed) {
+                            endOfResults = true;
                             const parseError = {
                                 error: `响应解析失败(status=${response.status})`,
                                 error_info: {
@@ -2994,9 +3045,8 @@ app.registerExtension({
                                     },
                                 },
                             };
-                            if (reset) {
-                                imageGrid.innerHTML = "";
-                                renderErrorCell(parseError, requestPage);
+                            if (reset && previousView.posts.length) {
+                                showToast('页面加载失败，已保留当前内容', 'warning');
                                 return;
                             }
                             renderErrorCell(parseError, requestPage);
@@ -3004,27 +3054,35 @@ app.registerExtension({
                         }
 
                         if (reset) {
-                            imageGrid.replaceChildren();
+                            clearGallery();
                             imageGrid.scrollTop = 0;
+                            selectedPosts.clear();
+                            thumbnailStates.clear();
+                            if (previousView.tags !== currentTags) temporaryTagEdits = {};
+                            for (const id of Object.keys(originalPostCache)) {
+                                if (!temporaryTagEdits[id]) delete originalPostCache[id];
+                            }
+                            if (hasCommittedView) updateSelectionData();
                         }
+                        hasCommittedView = true;
                         viewCommitted = true;
 
                         // 先分离 error 占位格与正常 post
                         const errorPosts = newPosts.filter(p => p && p.error);
                         const normalRaw = newPosts.filter(p => !p || !p.error);
-                        logger.info(`[fetchAndRender] 解析结果: total=${newPosts.length} error=${errorPosts.length} normalRaw=${normalRaw.length}`);
+                        logger.debug(`[fetchAndRender] 解析结果: total=${newPosts.length} error=${errorPosts.length} normalRaw=${normalRaw.length}`);
 
                         // 先去重（仅 cursor/pid 模式，G站 dedup=off 纯翻页不过滤）
                         const isGelbooruDedupOff = src === "gelbooru" && dedup === "off";
                         let freshRaw;
                         if (isGelbooruDedupOff) {
                             freshRaw = normalRaw;
-                            logger.info(`[fetchAndRender] G站dedup=off纯翻页: seenPostIds跳过 normalRaw=${normalRaw.length}`);
+                            logger.debug(`[fetchAndRender] G站dedup=off纯翻页: seenPostIds跳过 normalRaw=${normalRaw.length}`);
                         } else {
                             const beforeCount = seenPostIds.size;
                             freshRaw = normalRaw.filter(p => !seenPostIds.has(String(p.id)));
                             freshRaw.forEach(p => seenPostIds.add(String(p.id)));
-                            logger.info(`[fetchAndRender] 去重: seenPostIds从${beforeCount}到${seenPostIds.size} freshRaw=${freshRaw.length}`);
+                            logger.debug(`[fetchAndRender] 去重: seenPostIds从${beforeCount}到${seenPostIds.size} freshRaw=${freshRaw.length}`);
                         }
 
                         // 对正常格做过滤
@@ -3037,21 +3095,21 @@ app.registerExtension({
 
                         if (newPosts.length === 0 && errorPosts.length === 0) {
                             endOfResults = true;
-                            logger.info(`[fetchAndRender] → endOfResults=置true (newPosts=0 errorPosts=0)`);
+                            logger.debug(`[fetchAndRender] → endOfResults=置true (newPosts=0 errorPosts=0)`);
                             if (reset) {
-                                imageGrid.innerHTML = `<p class="danbooru-status">${t('noResults')}</p>`;
+                                showGridStatus(t('noResults'));
                             } else {
                                 // 非首次：不销毁已加载内容，底部显示到底提示
-                                renderErrorCell({ error: "没有更多结果了" }, requestPage);
+                                imageGrid.append($el('p.danbooru-status', { textContent: '没有更多结果了' }));
                             }
                             return;
                         }
 
-                        logger.info(`[fetchAndRender] 过滤后: freshRaw->filteredPosts=${filteredPosts.length}/${freshRaw.length}`);
+                        logger.debug(`[fetchAndRender] 过滤后: freshRaw->filteredPosts=${filteredPosts.length}/${freshRaw.length}`);
 
                         if (filteredPosts.length === 0 && freshRaw.length === 0 && reset && errorPosts.length === 0) {
-                            logger.info(`[fetchAndRender] reset无结果, 显示noResults`);
-                            imageGrid.innerHTML = `<p class="danbooru-status">${t('noResults')}</p>`;
+                            logger.debug(`[fetchAndRender] reset无结果, 显示noResults`);
+                            showGridStatus(t('noResults'));
                             return;
                         }
 
@@ -3060,7 +3118,7 @@ app.registerExtension({
                             lastPostId = normalRaw[normalRaw.length - 1].id;
                             logger.debug(`[fetchAndRender] 更新lastPostId=${lastPostId}`);
                         } else {
-                            logger.warn(`[fetchAndRender] normalRaw为空, lastPostId不变=${lastPostId}`);
+                            logger.debug(`[fetchAndRender] normalRaw为空, lastPostId不变=${lastPostId}`);
                         }
 
                         // currentPage 表示下一批的逻辑页码；底层游标请求可使用不同的 API 页码。
@@ -3069,7 +3127,7 @@ app.registerExtension({
 
                         posts.push(...filteredPosts);
                         filteredPosts.forEach(post => renderPost(post, requestPage));
-                        logger.info(`[fetchAndRender] 渲染${filteredPosts.length}张, 总posts=${posts.length}`);
+                        logger.debug(`[fetchAndRender] 渲染${filteredPosts.length}张, 总posts=${posts.length}`);
 
                         // Offscreen cards are virtualized without removing session data or grid positions.
 
@@ -3077,7 +3135,7 @@ app.registerExtension({
                         const isDedupOff = src === "gelbooru" && dedup === "off";
                         if (!isDedupOff && freshRaw.length === 0 && normalRaw.length > 0 && !reset) {
                             endOfResults = true;
-                            logger.warn(`[fetchAndRender] ★去重陷阱触发★ freshRaw=0 normalRaw=${normalRaw.length} 判定到底 page=${currentPage}`);
+                            logger.debug(`[fetchAndRender] ★去重陷阱触发★ freshRaw=0 normalRaw=${normalRaw.length} 判定到底 page=${currentPage}`);
                             return;
                         }
                         if (isGelbooruDedupOff) {
@@ -3088,8 +3146,8 @@ app.registerExtension({
 
                         // Filter-cascade guard
                         if (filteredPosts.length === 0 && !reset) {
-                            logger.warn(`[fetchAndRender] filteredPosts空(非reset), 延迟1.5s后重试`);
-                            await new Promise(r => setTimeout(r, 1500));
+                            logger.debug(`[fetchAndRender] filteredPosts空(非reset), 延迟1.5s后重试`);
+                            await new Promise(r => later(r, 1500));
                         }
 
                     } catch (e) {
@@ -3122,9 +3180,9 @@ app.registerExtension({
                                     details: { raw_exception: `${e.name || "Error"}: ${e.message || e}` },
                                 },
                         };
-                        if (reset) {
-                            imageGrid.innerHTML = "";
-                            renderErrorCell(requestError, requestPage);
+                        if (reset && previousView.posts.length) {
+                            endOfResults = true;
+                            showToast('页面加载失败，已保留当前内容', 'warning');
                         } else {
                             logger.warn('[fetchAndRender] 加载失败，保留已有内容:', e?.message || e);
                             renderErrorCell(requestError, requestPage);
@@ -3140,12 +3198,11 @@ app.registerExtension({
                             currentTags = previousView.tags;
                             seenPostIds.clear();
                             previousView.seen.forEach(id => seenPostIds.add(id));
-                            imageGrid.replaceChildren(...previousView.children);
                             imageGrid.scrollTop = previousView.scroll;
                         }
                         isLoading = false;
                         if (activePostsController === requestController) activePostsController = null;
-                        logger.info(`[fetchAndRender] finally: isLoading=置false endOfResults=${endOfResults} parseFailed=${parseFailed}`);
+                        logger.debug(`[fetchAndRender] finally: isLoading=置false endOfResults=${endOfResults} parseFailed=${parseFailed}`);
                         refreshButton.classList.remove("loading");
                         refreshButton.disabled = false;
                         const indicator = imageGrid.querySelector('.danbooru-loading');
@@ -3153,186 +3210,44 @@ app.registerExtension({
                         updateCurrentPageIndicator();
                         // 每次加载完成后检查是否需要补充更多（maybeLoadMore）
                         if (!endOfResults && !parseFailed) {
-                            logger.info(`[fetchAndRender] finally → 调用maybeLoadMore`);
+                            logger.debug(`[fetchAndRender] finally → 调用maybeLoadMore`);
                             maybeLoadMore();
                         } else {
-                            logger.warn(`[fetchAndRender] finally → 跳过maybeLoadMore: endOfResults=${endOfResults} parseFailed=${parseFailed}`);
+                            logger.debug(`[fetchAndRender] finally → 跳过maybeLoadMore: endOfResults=${endOfResults} parseFailed=${parseFailed}`);
                         }
                     }
                 };
 
+                let loadScheduled = false;
                 const maybeLoadMore = () => {
-                    if (!favoritesMode && usingLocal()) return;
-                    if (isLoading || endOfResults) {
-                        logger.warn(`[maybeLoadMore] 跳过: isLoading=${isLoading} endOfResults=${endOfResults}`);
-                        return;
-                    }
-                    const bufferTarget = parseInt(uiSettings.preload_count, 10) || 40;
-                    const scrollH = imageGrid.scrollHeight;
-                    let viewedCount = 0;
-                    if (scrollH > 0) {
-                        const viewedRatio = Math.min(1, (imageGrid.scrollTop + imageGrid.clientHeight) / scrollH);
-                        viewedCount = Math.floor(posts.length * viewedRatio);
-                    }
-                    const aheadBuffer = posts.length - viewedCount;
-                    logger.info(`[maybeLoadMore] posts=${posts.length} viewedCount=${viewedCount} aheadBuffer=${aheadBuffer} bufferTarget=${bufferTarget}`);
-                    if (aheadBuffer < bufferTarget) {
-                        logger.info(`[maybeLoadMore] trigger: aheadBuffer=${aheadBuffer}<${bufferTarget}`);
-                        setTimeout(() => fetchAndRender(false), 0);
-                    } else {
-                        logger.debug(`[maybeLoadMore] skip: aheadBuffer=${aheadBuffer}>=${bufferTarget}`);
-                    }
-                };
-
-                // 2 秒定时轮询检查前方缓冲，不够就自动补货
-                this._galleryLoadTimer = setInterval(() => {
-                    if (!container.isConnected || (!favoritesMode && usingLocal())) return;
-                    const viewport = imageGrid.getBoundingClientRect();
-                    let retries = 0;
-                    for (const card of imageGrid.children) {
-                        if (card._retryThumbnailIfVisible?.(viewport) && ++retries >= 2) break;
-                    }
-                    logger.debug(`[setInterval] tick`);
-                    maybeLoadMore();
-                }, 2000);
-
-                const resizeGrid = () => {
-                    try {
-                        const cs = window.getComputedStyle(imageGrid);
-                        const rowGap = parseInt(cs.getPropertyValue('grid-row-gap')) || parseInt(cs.rowGap) || 5;
-                        const rowHeight = parseInt(cs.getPropertyValue('grid-auto-rows')) || 1;
-
-                        const updates = [];
-                        Array.from(imageGrid.children).forEach((wrapper) => {
-                            const img = wrapper.querySelector('img');
-                            if ((img && img.clientHeight > 0) || wrapper.dataset.virtual === '1' || wrapper.classList.contains('danbooru-error-wrapper')) {
-                                const spans = Math.ceil((wrapper.offsetHeight + rowGap) / (rowHeight + rowGap));
-                                updates.push([wrapper, `span ${spans}`]);
-                            }
-                        });
-                        for (const [wrapper, span] of updates) {
-                            if (wrapper.style.gridRowEnd !== span) wrapper.style.gridRowEnd = span;
-                        }
-                    } catch (e) {
-                        // 计算失败不影响主体流程
-                    }
-                }
-
-                // Pre-reserve grid space from post dimensions so rate-limited async loads
-                // don't cause the waterfall to jump every time an image arrives.
-                let cachedColumnWidth = 0;
-                const getColumnWidth = () => {
-                    if (cachedColumnWidth > 0) return cachedColumnWidth;
-                    try {
-                        const cs = window.getComputedStyle(imageGrid);
-                        const template = cs.gridTemplateColumns;
-                        if (template && template !== 'none') {
-                            const cols = template.split(' ');
-                            const px = parseFloat(cols[0]);
-                            if (px > 0) cachedColumnWidth = px;
-                        }
-                    } catch (e) {}
-                    return cachedColumnWidth || 150; // grid 未 layout 时保底 150px
-                };
-                const computeSpanFromDims = (imgW, imgH) => {
-                    const colW = getColumnWidth();
-                    if (!colW || !imgW || !imgH) return 0;
-                    const cs = window.getComputedStyle(imageGrid);
-                    const rowGap = parseInt(cs.gridRowGap) || parseInt(cs.rowGap) || 5;
-                    const rowHeight = parseInt(cs.gridAutoRows) || 1;
-                    const renderedH = Math.max(0, colW - 4) * (imgH / imgW) + 4;
-                    return Math.ceil((renderedH + rowGap) / (rowHeight + rowGap));
-                };
-                // Coalesce rapid onload calls (rate-limited loads fire 200ms apart; batching
-                // to one reflow per frame avoids N² layout work as the page fills in).
-                let resizeGridTimer = null;
-                const scheduleResizeGrid = () => {
-                    if (resizeGridTimer) return;
-                    resizeGridTimer = requestAnimationFrame(() => {
-                        resizeGridTimer = null;
-                        resizeGrid();
+                    if (!initialized || disposed || isLoading || endOfResults || (!favoritesMode && usingLocal())) return;
+                    if (document.hidden || !viewport.visible || !container.isConnected) return;
+                    const ahead = viewport.entries.length - viewport.range.lastIndex - 1;
+                    if (ahead >= (parseInt(uiSettings.preload_count, 10) || 40) || loadScheduled) return;
+                    loadScheduled = true;
+                    queueMicrotask(() => {
+                        loadScheduled = false;
+                        if (!disposed && !isLoading && !endOfResults) void fetchAndRender(false);
                     });
                 };
-
-                // Keep the session order and grid positions; only unload offscreen card contents.
-                const viewportObserver = new IntersectionObserver((entries) => {
-                    for (const entry of entries) {
-                        const card = entry.target;
-                        if (card.parentElement !== imageGrid) {
-                            viewportObserver.unobserve(card);
-                            continue;
-                        }
-                        const post = card._galleryPost;
-                        if (!post || post.error) continue;
-                        if (entry.isIntersecting && card.dataset.virtual === '1') {
-                            const restored = createPostElement(post, Number(card.dataset.galleryPage));
-                            if (restored) {
-                                restored.style.gridRowEnd = card.style.gridRowEnd;
-                                const img = restored.querySelector('img');
-                                if (img) img.style.aspectRatio = card.style.aspectRatio;
-                                card.replaceWith(restored);
-                            }
-                        } else if (!entry.isIntersecting && card.dataset.virtual !== '1' && !card.classList.contains('selected')) {
-                            const img = card.querySelector('img');
-                            const width = img?.naturalWidth || post.image_width || 1;
-                            const height = img?.naturalHeight || post.image_height || 1;
-                            const placeholder = $el('div.danbooru-image-wrapper');
-                            placeholder.dataset.virtual = '1';
-                            placeholder.dataset.postId = card.dataset.postId;
-                            placeholder.dataset.galleryPage = card.dataset.galleryPage;
-                            placeholder._galleryPost = post;
-                            placeholder.style.gridRowEnd = card.style.gridRowEnd;
-                            placeholder.style.aspectRatio = `${width} / ${height}`;
-                            placeholder.style.pointerEvents = 'none';
-                            gelbooruPrefetchObserver?.unobserve(card);
-                            viewportObserver.unobserve(card);
-                            card.replaceWith(placeholder);
-                            if (!temporaryTagEdits[post.id]) delete originalPostCache[post.id];
-                        }
-                    }
-                }, { root: imageGrid, rootMargin: '600px 0px' });
-                const cardMutationObserver = new MutationObserver((records) => {
-                    for (const record of records) {
-                        for (const card of record.removedNodes) {
-                            if (card.nodeType !== 1) continue;
-                            viewportObserver.unobserve(card);
-                            gelbooruPrefetchObserver?.unobserve(card);
-                        }
-                        for (const card of record.addedNodes) {
-                            if (card.nodeType === 1 && card._galleryPost && card.parentElement === imageGrid) viewportObserver.observe(card);
-                        }
-                    }
-                });
-                cardMutationObserver.observe(imageGrid, { childList: true });
-                this._galleryViewportCleanup = () => {
-                    viewportObserver.disconnect();
-                    cardMutationObserver.disconnect();
-                };
+                const scheduleResizeGrid = () => viewport.schedule();
 
                 const showEditPanel = (post) => {
                     markActive();
                     // 在打开编辑面板时，检查当前图像是否被选中
                     // 强制将当前编辑的图像设置为选中状态，并更新 selectionWidget
-                    const currentSelectedElement = imageGrid.querySelector('.danbooru-image-wrapper.selected');
-                    if (currentSelectedElement && currentSelectedElement.dataset.postId && currentSelectedElement.dataset.postId != post.id) { // 检查 dataset.postId 是否存在
-                        currentSelectedElement.classList.remove('selected');
-
-                    }
-                    const targetWrapper = imageGrid.querySelector(`.danbooru-image-wrapper[data-post-id="${post.id}"]`);
-                    if (targetWrapper) {
-                        targetWrapper.classList.add('selected');
-                        // 触发一次点击事件来更新 selectionWidget
-                        // 注意：这里直接调用 onclick 可能会导致事件冒泡问题，
-                        // 更好的方式是直接更新 selectionWidget 的值
-                        // targetWrapper.querySelector('img').click();
-                        // 而是直接更新 selectionWidget
-                        updateSelectionData();
-                    }
+                    if (!uiSettings.multi_select_enabled) selectedPosts.clear();
+                    selectedPosts.set(postKey(post), post);
+                    imageGrid.querySelectorAll('.danbooru-image-wrapper').forEach(card => {
+                        card.classList.toggle('selected', selectedPosts.has(postKey(card._galleryPost)));
+                    });
+                    updateSelectionData();
                     const isPostCurrentlySelected = true; // 因为我们已经强制选中了
 
 
                     if (!temporaryTagEdits[post.id]) {
                         // Create a deep copy for editing if it doesn't exist
+                        originalPostCache[post.id] ||= post;
                         temporaryTagEdits[post.id] = JSON.parse(JSON.stringify(post));
                     }
                     const editablePost = temporaryTagEdits[post.id];
@@ -3347,6 +3262,11 @@ app.registerExtension({
                     });
 
                     // Panel content
+                    panel._autocompletes = new Set();
+                    panel._dispose = () => {
+                        for (const autocomplete of panel._autocompletes) autocomplete.destroy();
+                        panel._autocompletes.clear();
+                    };
                     const content = $el("div.danbooru-edit-panel-content", {
                         style: {
                             backgroundColor: "var(--comfy-menu-bg)", border: "1px solid var(--input-border-color)",
@@ -3369,7 +3289,7 @@ app.registerExtension({
                     const tagsContainer = $el("div.danbooru-edit-tags-container", { style: { overflowY: "auto", flex: "1", paddingRight: "10px" } });
 
                     const closePanel = async (wasSelectedOnOpen) => { // 接收打开面板时的选中状态
-                        panel.remove();
+                        removeOwned(panel);
                         const currentPostInArray = posts.find(p => p.id == post.id); // 获取posts数组中最新的post数据
                         if (!currentPostInArray) {
                             return;
@@ -3408,56 +3328,12 @@ app.registerExtension({
                             postDataToRender = currentPostInArray; // 确保渲染时使用 posts 数组中的当前数据
                         }
 
-                        // 重新渲染该post
-                        const oldPostElement = imageGrid.querySelector(`.danbooru-image-wrapper[data-post-id="${post.id}"]`);
+                        const updatedPost = posts.find(item => item.id == post.id);
+                        if (wasSelectedOnOpen) selectedPosts.set(postKey(updatedPost), updatedPost);
+                        else selectedPosts.clear();
+                        viewport.refresh(updatedPost);
+                        updateSelectionData();
 
-                        const postIndex = posts.findIndex(p => p.id == post.id);
-                        const newPostElement = createPostElement(posts[postIndex], oldPostElement?.dataset.galleryPage); // 使用 posts 数组中的最新数据
-                        if (newPostElement) {
-                            if (oldPostElement && oldPostElement.parentNode) {
-                                oldPostElement.parentNode.replaceChild(newPostElement, oldPostElement);
-                            } else {
-                                imageGrid.prepend(newPostElement);
-                            }
-                            resizeGrid();
-                        } else {
-                            if (oldPostElement) {
-                                oldPostElement.remove();
-                            }
-                        }
-
-                        // 无论是否编辑，如果打开面板时是选中状态，都强制更新selectionWidget和选中样式
-                        if (wasSelectedOnOpen) {
-                            // 重新给新元素添加选中状态
-                            if (newPostElement) {
-                                newPostElement.classList.add('selected');
-
-                            }
-                            updateSelectionData();
-                        } else { // 如果打开面板时未选中，则清除所有选中的图像和提示词
-
-                            imageGrid.querySelectorAll('.danbooru-image-wrapper.selected').forEach(w => {
-
-                                w.classList.remove('selected');
-                            });
-                            if (nodeInstance && nodeInstance.widgets) {
-                                const selectionWidget = nodeInstance.widgets.find(w => w.name === "selection_data");
-                                if (selectionWidget) {
-                                    selectionWidget.value = JSON.stringify({});
-                                    selectionWidget.callback();
-
-                                }
-                            }
-                        }
-
-                        // 重新计算 isTrulyEdited 状态并更新指示器 (这里调用 updateEditedStatus 会基于新的逻辑进行判断)
-                        // 注意：这里不再需要手动删除 temporaryTagEdits，因为 updateEditedStatus 会在判断为未编辑时将其设置为 undefined
-                        let indicator = newPostElement ? newPostElement.querySelector('.danbooru-edited-indicator') : null;
-                        if (newPostElement) {
-                            // 确保 newPostElement 已经添加到 DOM 中，updateEditedStatus 才能找到 indicator
-                            // 或者直接传递 isTrulyEdited 状态
-                            updateEditedStatus(newPostElement, post.id); // 调用更新函数
-                        }
                     };
 
                     content.appendChild(titleBar);
@@ -3568,11 +3444,11 @@ app.registerExtension({
                     // Close panel when clicking background
                     panel.addEventListener('click', (e) => {
                         if (e.target === panel) {
-                            closePanel();
+                            closePanel(isPostCurrentlySelected);
                         }
                     });
 
-                    document.body.appendChild(panel);
+                    document.body.appendChild(own(panel));
 
                     renderTagsInPanel(tagsContainer, editablePost, panel);
                 };
@@ -3593,7 +3469,9 @@ app.registerExtension({
                         ]);
 
                         const removeExistingMenus = () => {
-                            document.querySelectorAll('.danbooru-tag-context-menu').forEach(menu => menu.remove());
+                            for (const menu of ownedElements) {
+                                if (menu.classList.contains('danbooru-tag-context-menu')) removeOwned(menu);
+                            }
                         };
 
                         const isEnabled = () => !(postData.disabled_prompt_tags || []).includes(tag);
@@ -3671,7 +3549,7 @@ app.registerExtension({
                                     searchInput.value = newValue;
                                     searchInput.dispatchEvent(new Event('input'));
                                     fetchAndRender(true);
-                                    menu.remove();
+                                    removeOwned(menu);
                                 }
                             });
 
@@ -3696,14 +3574,14 @@ app.registerExtension({
                                     }
                                     // 强制重新渲染以更新状态
                                     renderTagsInPanel(tagsContainer, temporaryTagEdits[postData.id] || postData, panel);
-                                    menu.remove();
+                                    removeOwned(menu);
                                 }
                             });
 
                             menu.appendChild(searchOption);
                             menu.appendChild(deleteOption);
 
-                            document.body.appendChild(menu);
+                            document.body.appendChild(own(menu));
 
                             const rect = span.getBoundingClientRect();
                             menu.style.left = `${rect.left}px`;
@@ -3711,11 +3589,11 @@ app.registerExtension({
 
                             const closeMenuHandler = (event) => {
                                 if (!menu.contains(event.target)) {
-                                    menu.remove();
+                                    removeOwned(menu);
                                     document.removeEventListener('click', closeMenuHandler, true);
                                 }
                             };
-                            document.addEventListener('click', closeMenuHandler, true);
+                            document.addEventListener('click', closeMenuHandler, { capture: true, signal: lifetime.signal });
                         });
 
                         return span;
@@ -3831,11 +3709,13 @@ app.registerExtension({
                                                 renderTagsInPanel(tagsContainer, temporaryTagEdits[postData.id] || postData, panel);
                                             }
                                             tagAutocomplete.destroy();
+                                            panel._autocompletes.delete(tagAutocomplete);
                                             inputContainer.remove();
                                             addButton.style.display = 'inline-flex';
                                         }
                                     });
 
+                                    panel._autocompletes.add(tagAutocomplete);
                                     input.addEventListener('keydown', (e) => {
                                         if (e.key === 'Enter' && input.value.trim()) {
                                             const newTag = input.value.trim().replace(/\s/g, '_');
@@ -3849,10 +3729,12 @@ app.registerExtension({
                                                 renderTagsInPanel(tagsContainer, temporaryTagEdits[postData.id] || postData, panel);
                                             }
                                             tagAutocomplete.destroy();
+                                            panel._autocompletes.delete(tagAutocomplete);
                                             inputContainer.remove();
                                             addButton.style.display = 'inline-flex';
                                         } else if (e.key === 'Escape') {
                                             tagAutocomplete.destroy();
+                                            panel._autocompletes.delete(tagAutocomplete);
                                             inputContainer.remove();
                                             addButton.style.display = 'inline-flex';
                                         }
@@ -3860,9 +3742,10 @@ app.registerExtension({
 
                                     const blurHandler = () => {
                                         // 延迟以便点击建议能够注册
-                                        setTimeout(() => {
+                                        later(() => {
                                             if (!inputContainer.contains(document.activeElement)) {
                                                 tagAutocomplete.destroy();
+                                            panel._autocompletes.delete(tagAutocomplete);
                                                 inputContainer.remove();
                                                 addButton.style.display = 'inline-flex';
                                             }
@@ -3906,12 +3789,11 @@ app.registerExtension({
 
                 // 辅助函数：收集所有选中图片的数据并更新 widget
                 const updateSelectionData = () => {
-                    const selectedWrappers = imageGrid.querySelectorAll('.danbooru-image-wrapper.selected');
                     const selections = [];
 
-                    for (const wrapper of selectedWrappers) {
-                        const postId = wrapper.dataset.postId;
-                        const postData = posts.find(p => p.id == postId) || temporaryTagEdits[postId];
+                    for (const selected of selectedPosts.values()) {
+                        const postId = String(selected.id);
+                        const postData = posts.find(p => p.id == postId) || temporaryTagEdits[postId] || selected;
                         if (postData) {
                             const prompt = buildPromptForPost(postData);
                             const updatedPostData = posts.find(p => p.id == postId) || temporaryTagEdits[postId] || postData;
@@ -3952,8 +3834,7 @@ app.registerExtension({
                 const prepareSelectionForQueue = async () => {
                     try {
                         if (usingLocal()) throw new Error('离线未缓存原图，无法输出图像；可以编辑、复制提示词，或手动重试联网。');
-                        const selectedWrappers = imageGrid.querySelectorAll('.danbooru-image-wrapper.selected');
-                        if (selectedWrappers.length === 0) {
+                        if (selectedPosts.size === 0) {
                             let savedSelectionData = {};
                             try {
                                 savedSelectionData = JSON.parse(selectionWidget.value || "{}");
@@ -4008,9 +3889,9 @@ app.registerExtension({
                             logger.info(`[Queue] 保留已保存的 ${savedSelections.length} 条选择 nodeId=${nodeInstanceId} queueId=${selectionQueueId}`);
                             return;
                         }
-                        const selections = (await Promise.all(Array.from(selectedWrappers, async (wrapper) => {
-                            const postId = wrapper.dataset.postId;
-                            const postData = posts.find(p => p.id == postId) || temporaryTagEdits[postId];
+                        const selections = (await Promise.all(Array.from(selectedPosts.values(), async (selected) => {
+                            const postId = String(selected.id);
+                            const postData = posts.find(p => p.id == postId) || temporaryTagEdits[postId] || selected;
                             if (!postData) {
                                 throw new Error(`${t('queuePostMissing')}: ${postId}`);
                             }
@@ -4064,7 +3945,7 @@ app.registerExtension({
 
                 // 辅助函数：更新选中计数显示
                 const updateSelectionCount = (count) => {
-                    const countBadge = document.querySelector('.danbooru-selection-count');
+                    const countBadge = container.querySelector('.danbooru-selection-count');
                     if (countBadge) {
                         if (count > 0 && uiSettings.multi_select_enabled) {
                             countBadge.textContent = t('selectedCount').replace('{count}', count);
@@ -4077,24 +3958,22 @@ app.registerExtension({
 
                 // 辅助函数：清除所有选中
                 const clearAllSelections = () => {
+                    selectedPosts.clear();
                     imageGrid.querySelectorAll('.danbooru-image-wrapper.selected').forEach(w => {
                         w.classList.remove('selected');
                     });
                     updateSelectionData();
                 };
 
-                const createPostElement = (post, galleryPage = null) => {
+                const createPostElement = (post, galleryPage = null, layoutEntry = null) => {
                     const rememberedPage = post && typeof post === "object" ? postGalleryPages.get(post) : null;
                     const resolvedGalleryPage = normalizePageNumber(galleryPage, normalizePageNumber(rememberedPage, currentVisiblePage));
                     if (post && typeof post === "object") postGalleryPages.set(post, resolvedGalleryPage);
 
                     // error 占位格：红色边框，直接显示错误文本，占据一个图片格空间
                     if (post && post.error) {
-                        const gridStyle = window.getComputedStyle(imageGrid);
-                        const rowGap = parseFloat(gridStyle.rowGap) || 5;
-                        const rowHeight = parseFloat(gridStyle.gridAutoRows) || 1;
                         const wrapper = $el("div.danbooru-image-wrapper", {
-                            style: { border: '1px solid #ff6b6b', minHeight: '180px', display: 'flex', alignItems: 'stretch', justifyContent: 'stretch', color: '#ff6b6b', fontSize: '0.85em', padding: '8px', textAlign: 'left', background: 'var(--comfy-input-bg)', gridRowEnd: `span ${Math.ceil((198 + rowGap) / (rowHeight + rowGap))}` }
+                            style: { border: '1px solid #ff6b6b', color: '#ff6b6b', fontSize: '0.85em', padding: '8px', textAlign: 'left', background: 'var(--comfy-input-bg)', overflow: 'auto' }
                         });
                         wrapper._galleryPost = post;
                         wrapper.classList.add("danbooru-error-wrapper");
@@ -4111,30 +3990,44 @@ app.registerExtension({
 
                     if (!post.id || (!post._local_favorite && post.source_site === 'gelbooru' && !post.preview_file_url)) return null;
 
-                    const wrapper = $el("div.danbooru-image-wrapper");
+                    // Reuse the fixed card tree, including SVG controls. Repeated destruction
+                    // fragments Blink's native heap even when JS and DOM counts stay bounded.
+                    const recycled = recycledCards.pop();
+                    const parts = recycled?._parts || new Map();
+                    let wrapper;
+                    const part = (key, selector, props = {}, children = []) => {
+                        let element = parts.get(key);
+                        if (!element) { element = $el(selector); parts.set(key, element); }
+                        for (const [name, value] of Object.entries(props)) {
+                            if (name === 'style') Object.assign(element.style, value);
+                            else if (name === 'innerHTML') {
+                                if (element._markup !== value || element.innerHTML !== element._renderedMarkup) {
+                                    element.innerHTML = value;
+                                    element._markup = value;
+                                    element._renderedMarkup = element.innerHTML;
+                                }
+                            } else if (name === 'className') element.className = [...selector.split('.').slice(1), value].filter(Boolean).join(' ');
+                            else if (name.startsWith('data-')) element.setAttribute(name, value);
+                            else if (name === 'onclick') element.onclick = async event => {
+                                wrapper._busy++;
+                                try { return await value(event); } finally { wrapper._busy--; }
+                            };
+                            else element[name] = value;
+                        }
+                        if (children.length) element.replaceChildren(...children);
+                        return element;
+                    };
+                    wrapper = part('wrapper', 'div.danbooru-image-wrapper');
+                    wrapper.className = 'danbooru-image-wrapper';
+                    wrapper.replaceChildren();
+                    wrapper._parts = parts;
+                    wrapper._busy = 0;
                     wrapper._galleryPost = post;
                     wrapper.dataset.postId = post.id; // 显式设置 data-post-id
                     if (resolvedGalleryPage) wrapper.dataset.galleryPage = String(resolvedGalleryPage);
 
-                    // Reserve grid space up-front from the post's real dimensions so the
-                    // waterfall is stable before thumbnails finish loading.
-                    // G公开页返回的 post 经常 image_width/height=0，按列宽的估算方形保底高度
-                    let reservedSpans = 0;
-                    if (post.image_width && post.image_height) {
-                        reservedSpans = computeSpanFromDims(post.image_width, post.image_height);
-                    }
-                    if (reservedSpans <= 0) {
-                        const colW = getColumnWidth();
-                        const rowGap = parseInt(window.getComputedStyle(imageGrid).getPropertyValue('grid-row-gap')) || parseInt(window.getComputedStyle(imageGrid).rowGap) || 5;
-                        const rowHeight = parseInt(window.getComputedStyle(imageGrid).getPropertyValue('grid-auto-rows')) || 1;
-                        reservedSpans = colW > 0 ? Math.ceil((colW + rowGap) / (rowHeight + rowGap)) : 200;
-                    }
-                    if (reservedSpans > 0) wrapper.style.gridRowEnd = `span ${reservedSpans}`;
-
-                    // 首次创建post元素时，将原始post数据添加到 originalPostCache
-                    if (!originalPostCache[post.id]) {
-                        originalPostCache[post.id] = JSON.parse(JSON.stringify(post));
-                    }
+                    wrapper.classList.toggle('selected', selectedPosts.has(postKey(post)));
+                    if (!originalPostCache[post.id]) originalPostCache[post.id] = post;
 
                     // Check and apply edited status on creation
                     updateEditedStatus(wrapper, post.id);
@@ -4146,105 +4039,41 @@ app.registerExtension({
                     const thumbnailUrl = post._favorite_thumbnail_url || (post.source_site === 'gelbooru'
                         ? `/danbooru_gallery/image_proxy?thumbnail=1&url=${encodeURIComponent(previewUrl)}`
                         : `/danbooru_gallery/offline/thumbnail?url=${encodeURIComponent(post.preview_file_url)}`);
-                    let thumbnailAttempts = 0;
-                    let thumbnailRetryAt = 0;
-                    let thumbnailLoading = false;
-                    const retryThumbnail = () => {
-                        if (thumbnailLoading || !wrapper.isConnected) return;
-                        thumbnailLoading = true;
-                        thumbnailAttempts++;
-                        retryThumbnailButton.disabled = true;
-                        thumbnailStatus.textContent = usingLocal()
-                            ? '正在检查本地缓存…' : '正在重试缩略图…';
-                        img.src = `${thumbnailUrl}&retry=${Date.now()}`;
-                    };
-                    const thumbnailStatus = $el('span', { textContent: '缩略图暂未加载' });
-                    const retryThumbnailButton = $el('button', {
-                        type: 'button', textContent: '重试缩略图',
-                        onpointerdown: (event) => event.stopPropagation(),
-                        onclick: (event) => { event.stopPropagation(); if (post._local_favorite) void retryFavorite(post); else retryThumbnail(); },
+                    const thumbnailKey = `${offlineScope}:${post.source_site || currentSource()}:${thumbnailUrl}`;
+                    let thumbnailState = thumbnailStates.get(thumbnailKey);
+                    if (!thumbnailState) {
+                        thumbnailState = { attempts: 0, retryAt: 0 };
+                        thumbnailStates.set(thumbnailKey, thumbnailState);
+                    }
+                    let thumbnailHandle = null;
+                    let cardDisposed = false;
+                    const thumbnailStatus = part('status', 'span', { textContent: '等待加载…' });
+                    const retryThumbnailButton = part('retry', 'button', {
+                        type: 'button', textContent: '重试缩略图', style: { display: 'none' },
+                        onpointerdown: event => event.stopPropagation(),
+                        onclick: event => {
+                            event.stopPropagation();
+                            if (post._local_favorite) void retryFavorite(post);
+                            else thumbnailHandle?.retry();
+                        },
                     });
-                    const thumbnailPlaceholder = $el('div.danbooru-thumbnail-placeholder', {
-                        style: { display: 'none' },
-                        onclick: (event) => { event.stopPropagation(); img.click(); },
+                    const thumbnailPlaceholder = part('placeholder', 'div.danbooru-thumbnail-placeholder', {
+                        style: { display: 'flex' },
+                        onclick: event => { event.stopPropagation(); img.click(); },
                     }, [thumbnailStatus, retryThumbnailButton]);
-                    wrapper._retryThumbnailIfVisible = (viewport) => {
-                        if (post._local_favorite || !thumbnailRetryAt || thumbnailLoading || thumbnailAttempts >= 3 || Date.now() < thumbnailRetryAt) return false;
-                        const bounds = wrapper.getBoundingClientRect();
-                        if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) return false;
-                        retryThumbnail();
-                        return true;
-                    };
-                    const img = $el("img", {
-                        src: thumbnailUrl,
-                        loading: "lazy",
-                        decoding: "async",
-                        onload: () => {
-                            thumbnailLoading = false;
-                            thumbnailRetryAt = 0;
-                            thumbnailPlaceholder.style.display = 'none';
-                            img.style.visibility = '';
-                            img.style.aspectRatio = '';
-                            retryThumbnailButton.disabled = false;
-                            scheduleResizeGrid();
-                        },
-                        onerror: (evt) => {
-                            if (post._local_favorite || post.source_site !== 'gelbooru') {
-                                thumbnailLoading = false;
-                                thumbnailRetryAt = Date.now() + 5000 * (2 ** thumbnailAttempts);
-                                img.style.visibility = 'hidden';
-                                img.style.aspectRatio = `${post.image_width || 1} / ${post.image_height || 1}`;
-                                thumbnailPlaceholder.style.display = 'flex';
-                                thumbnailStatus.textContent = post._local_favorite ? t('favoriteIncomplete') : usingLocal()
-                                    ? '本地暂无缩略图；可在设置 → 离线管理中重试联网。'
-                                    : '缩略图暂未加载，标签仍可使用';
-                                retryThumbnailButton.disabled = false;
-                                scheduleResizeGrid();
-                                return;
-                            }
-                            // 重试一次，仍失败则显示错误+刷新按钮
-                            if (!evt.target.dataset.retried) {
-                                evt.target.dataset.retried = '1';
-                                evt.target.src = evt.target.src;
-                                return;
-                            }
-                            wrapper.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;background:var(--comfy-input-bg);border-radius:4px;padding:8px;gap:6px;">
-                                <span style="color:#ff4444;font-size:11px;">加载失败</span>
-                                <button style="font-size:10px;padding:2px 8px;border:1px solid #666;border-radius:3px;background:transparent;color:var(--comfy-input-text);cursor:pointer;">刷新</button>
-                            </div>`;
-                            wrapper.querySelector('button').onclick = () => {
-                                const fresh = document.createElement('img');
-                                fresh.src = `/danbooru_gallery/image_proxy?thumbnail=1&url=${encodeURIComponent(previewUrl)}`;
-                                fresh.loading = "lazy";
-                                fresh.decoding = "async";
-                                fresh.onload = scheduleResizeGrid;
-                                fresh.onerror = () => { wrapper.style.display = 'none'; };
-                                wrapper.innerHTML = '';
-                                wrapper.appendChild(fresh);
-                                wrapper.appendChild(copyPromptButton);
-                            };
-                        },
+                    const img = part('image', 'canvas.danbooru-thumbnail', {
+                        width: 1, height: 1, role: 'img', ariaLabel: `缩略图 #${post.id}`,
                         onclick: async (e) => {
                             e.stopPropagation();
                             markActive(); // 标记自己为最后活跃节点
-                            const isSelected = wrapper.classList.contains('selected');
-                            const isMultiSelectMode = uiSettings.multi_select_enabled;
-
-                            // 单选模式下，先清除所有其他图像的选中状态
-                            if (!isMultiSelectMode) {
-                                imageGrid.querySelectorAll('.danbooru-image-wrapper').forEach(w => {
-                                    if (w !== wrapper) {
-                                        w.classList.remove('selected');
-                                    }
-                                });
-                            }
-
-                            // 切换当前图像的选中状态
-                            if (!isSelected) {
-                                wrapper.classList.add('selected');
-                            } else {
-                                wrapper.classList.remove('selected');
-                            }
+                            const key = postKey(post);
+                            const isSelected = selectedPosts.has(key);
+                            if (!uiSettings.multi_select_enabled) selectedPosts.clear();
+                            if (isSelected) selectedPosts.delete(key);
+                            else selectedPosts.set(key, post);
+                            imageGrid.querySelectorAll('.danbooru-image-wrapper').forEach(card => {
+                                card.classList.toggle('selected', selectedPosts.has(postKey(card._galleryPost)));
+                            });
 
                             // 收集所有选中图片的数据并更新 widget
                             updateSelectionData();
@@ -4257,12 +4086,14 @@ app.registerExtension({
                                     requireMedia: false,
                                     requireExactTags: false,
                                 });
-                                if (wrapper.classList.contains('selected')) updateSelectionData();
+                                if (!disposed && selectedPosts.has(postKey(post))) updateSelectionData();
                             }
                         },
                     });
 
-                    const copyPromptButton = $el("button.danbooru-copy-prompt-button", {
+                    img.style.visibility = 'hidden';
+
+                    const copyPromptButton = part('copy', "button.danbooru-copy-prompt-button", {
                         type: "button",
                         title: t('copyPrompt'),
                         ariaLabel: t('copyPrompt'),
@@ -4287,7 +4118,7 @@ app.registerExtension({
                     });
 
                     // 创建下载按钮
-                    const downloadButton = $el("button.danbooru-download-button", {
+                    const downloadButton = part('download', "button.danbooru-download-button", {
                         innerHTML: `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                             <polyline points="7 10 12 15 17 10"></polyline>
@@ -4337,7 +4168,7 @@ app.registerExtension({
                         globalTooltip = $el("div.danbooru-tag-tooltip", { style: { display: "none", position: "absolute", zIndex: "1000" } });
                         const tagsContainer = $el("div", { className: "danbooru-tooltip-tags" });
                         globalTooltip.appendChild(tagsContainer);
-                        document.body.appendChild(globalTooltip);
+                        document.body.appendChild(own(globalTooltip));
                     }
 
                     const createTagSpan = (tag, category, translation = null) => {
@@ -4351,19 +4182,19 @@ app.registerExtension({
 
                     let currentClickHandler = null;
 
-                    wrapper.addEventListener("mouseenter", async (e) => {
+                    const showTooltip = async () => {
                         if (!uiSettings.tooltip_enabled) return;
 
                         // 生成新的tooltip ID，使之前的异步请求失效
                         currentTooltipId++;
                         const thisTooltipId = currentTooltipId;
 
-                        clearTimeout(globalTooltipTimeout);
+                        cancelLater(globalTooltipTimeout);
 
                         const tagsContainer = globalTooltip.querySelector('.danbooru-tooltip-tags');
                         tagsContainer.innerHTML = '';
                         const postForTooltip = await hydrateGelbooruTooltipPost(post);
-                        if (thisTooltipId !== currentTooltipId) {
+                        if (cardDisposed || disposed || thisTooltipId !== currentTooltipId) {
                             return;
                         }
 
@@ -4430,7 +4261,7 @@ app.registerExtension({
                         }
 
                         // 检查tooltip ID是否仍然有效（防止快速切换时显示过期的tooltip）
-                        if (thisTooltipId !== currentTooltipId) {
+                        if (cardDisposed || disposed || thisTooltipId !== currentTooltipId) {
                             return; // 用户已经移动到另一张图片，放弃显示此tooltip
                         }
 
@@ -4449,6 +4280,7 @@ app.registerExtension({
                             }
                         });
 
+                        globalTooltip._owner = wrapper;
                         globalTooltip.style.display = "block";
 
                         // 添加点击其他地方隐藏tooltip的保护机制
@@ -4461,14 +4293,26 @@ app.registerExtension({
                         };
 
                         // 延迟添加点击监听器，避免立即触发
-                        setTimeout(() => {
-                            if (currentClickHandler) {
+                        later(() => {
+                            if (!cardDisposed && currentClickHandler) {
                                 document.addEventListener('click', currentClickHandler);
                             }
                         }, 10);
-                    });
+                    };
+                    const queueTooltip = () => {
+                        if (!uiSettings.tooltip_enabled || globalTooltipTimeout ||
+                            globalTooltip._owner === wrapper && globalTooltip.style.display === 'block') return;
+                        globalTooltipTimeout = later(() => {
+                            globalTooltipTimeout = null;
+                            if (!cardDisposed && !disposed && wrapper.matches(':hover') &&
+                                performance.now() >= tooltipSuppressedUntil) void showTooltip();
+                        }, Math.max(180, tooltipSuppressedUntil - performance.now()));
+                    };
+                    wrapper.onmouseenter = queueTooltip;
 
-                    wrapper.addEventListener("mouseleave", () => {
+                    wrapper.onmouseleave = () => {
+                        cancelLater(globalTooltipTimeout);
+                        globalTooltipTimeout = null;
                         // 增加tooltip ID，使当前的异步请求失效
                         currentTooltipId++;
 
@@ -4480,9 +4324,10 @@ app.registerExtension({
                             document.removeEventListener('click', currentClickHandler);
                             currentClickHandler = null;
                         }
-                    });
+                    };
 
-                    wrapper.addEventListener("mousemove", (e) => {
+                    wrapper.onmousemove = (e) => {
+                        queueTooltip();
                         if (globalTooltip.style.display !== 'block') return;
                         const rect = globalTooltip.getBoundingClientRect();
                         const buffer = 15;
@@ -4491,10 +4336,10 @@ app.registerExtension({
                         if (newTop + rect.height > window.innerHeight) newTop = e.clientY - rect.height - buffer;
                         globalTooltip.style.left = `${newLeft + window.scrollX}px`;
                         globalTooltip.style.top = `${newTop + window.scrollY}px`;
-                    });
+                    };
 
                     const isFavorited = Boolean(post._local_favorite) || userFavorites.includes(String(post.id));
-                    const favoriteButton = $el("button.danbooru-favorite-button", {
+                    const favoriteButton = part('favorite', "button.danbooru-favorite-button", {
                         "data-post-id": String(post.id),
                         innerHTML: favoriteIcon(isFavorited),
                         title: t(isFavorited ? 'unfavorite' : 'favorite'),
@@ -4506,10 +4351,11 @@ app.registerExtension({
                     });
 
                     // 创建按钮容器
-                    const buttonsContainer = $el("div.danbooru-image-buttons");
+                    const buttonsContainer = part('buttons', "div.danbooru-image-buttons");
+                    buttonsContainer.replaceChildren();
 
                     // 创建编辑模式按钮
-                    const editButton = $el("button.danbooru-edit-button", {
+                    const editButton = part('edit', "button.danbooru-edit-button", {
                         innerHTML: `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
                             <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
@@ -4533,7 +4379,7 @@ app.registerExtension({
                         }
                     });
 
-                    const viewImageButton = $el("button.danbooru-view-image-button", {
+                    const viewImageButton = part('view', "button.danbooru-view-image-button", {
                         innerHTML: `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
                         title: t('viewImage'),
                         onclick: async (e) => {
@@ -4569,25 +4415,55 @@ app.registerExtension({
                         }));
                     }
 
+                    wrapper._mount = priority => {
+                        thumbnailHandle = galleryThumbnails.acquire(thumbnailKey, thumbnailUrl, priority, entry => {
+                            if (cardDisposed) return;
+                            retryThumbnailButton.style.display = entry.status === 'error' ? '' : 'none';
+                            thumbnailStatus.textContent = entry.status === 'loading' ? '正在加载…'
+                                : entry.status === 'error' ? (usingLocal() ? '本地暂无缩略图' : '缩略图暂未加载，标签仍可使用') : '等待加载…';
+                            if (entry.bitmap && img._bitmap !== entry.bitmap) {
+                                img.width = entry.bitmap.width;
+                                img.height = entry.bitmap.height;
+                                img.getContext('2d').drawImage(entry.bitmap, 0, 0);
+                                img._bitmap = entry.bitmap;
+                                img.dataset.loaded = 'true';
+                                thumbnailPlaceholder.style.display = 'none';
+                                img.style.visibility = '';
+                                if (layoutEntry) viewport.setRatio(layoutEntry, img.width, img.height);
+                            }
+                        }, thumbnailState, !usingLocal() && !post._local_favorite);
+                        observeGelbooruPrefetch(wrapper, post);
+                    };
+                    wrapper._setPriority = priority => thumbnailHandle?.priority(priority);
+                    wrapper._dispose = () => {
+                        cardDisposed = true;
+                        thumbnailHandle?.release();
+                        gelbooruPrefetchObserver?.unobserve(wrapper);
+                        // Release canvas backing pixels immediately, independently of browser GC.
+                        img.width = 0;
+                        img.height = 0;
+                        img._bitmap = null;
+                        img.onclick = null;
+                        delete img.dataset.loaded;
+                        if (!disposed && !wrapper._busy && recycledCards.length < 128) recycledCards.push(wrapper);
+                        if (currentClickHandler) document.removeEventListener('click', currentClickHandler);
+                        if (globalTooltip?._owner === wrapper) {
+                            globalTooltip.style.display = 'none';
+                            globalTooltip._owner = null;
+                            currentTooltipId++;
+                        }
+                    };
                     wrapper.appendChild(img);
                     wrapper.appendChild(thumbnailPlaceholder);
                     wrapper.appendChild(buttonsContainer);
                     wrapper.appendChild(copyPromptButton);
-                    observeGelbooruPrefetch(wrapper, post);
-
                     return wrapper;
                 };
 
                 const renderPost = (post, galleryPage = null) => {
-                    if (post && post.error) {
-                        logger.info(`[renderPost] 错误格: "${post.error}" pid=${post.pid || '?'} page=${post.page || '?'}`);
-                    } else if (post) {
-                        logger.debug(`[renderPost] 正常格: id=${post.id} galleryPage=${galleryPage || '?'}`);
-                    }
-                    const element = createPostElement(post, galleryPage);
-                    if (element) {
-                        imageGrid.appendChild(element);
-                    }
+                    const page = galleryPage || postGalleryPages.get(post) || currentVisiblePage;
+                    postGalleryPages.set(post, page);
+                    viewport.append(post, page);
                 };
 
                 // 错误格：渲染的同时 push 进 posts，保持 posts 与 DOM 一一对应
@@ -4606,67 +4482,37 @@ app.registerExtension({
                 };
                 const updateErrorCellCount = (entry) => {
                     entry.post.error_count = entry.count;
-                    if (!entry.element) return;
-                    entry.element.dataset.errorCount = String(entry.count);
-                    const badge = entry.element.querySelector(".danbooru-error-merge-badge");
-                    if (badge) {
-                        badge.textContent = `同类错误已合并 x${entry.count}`;
-                        badge.style.display = entry.count > 1 ? "block" : "none";
-                    }
+                    viewport.refresh(entry.post);
                 };
                 const renderErrorCell = (errObj, galleryPage = currentVisiblePage) => {
                     const signature = getGalleryErrorSignature(errObj);
                     const existing = errorCellsBySignature.get(signature);
-                    if (existing && existing.element?.isConnected) {
+                    if (existing) {
                         existing.count += 1;
                         updateErrorCellCount(existing);
-                        return existing.element;
-                    }
-                    if (existing && !existing.element?.isConnected) {
-                        errorCellsBySignature.delete(signature);
+                        return existing.post;
                     }
                     const post = { ...errObj, id: `err_${errObj.pid || errObj.page || 'x'}_${_errSeq++}`, error_count: 1 };
                     posts.push(post);
-                    const element = createPostElement(post, galleryPage);
-                    if (element) {
-                        imageGrid.appendChild(element);
-                        errorCellsBySignature.set(signature, { post, element, count: 1 });
-                    }
-                    return element;
+                    viewport.append(post, galleryPage);
+                    errorCellsBySignature.set(signature, { post, count: 1 });
+                    return post;
                 };
 
-                const observer = new ResizeObserver(() => {
-                    cachedColumnWidth = 0;
-                    resizeGrid();
-                });
-                observer.observe(imageGrid);
-
-                let scrollTimeout;
-                imageGrid.addEventListener("scroll", () => {
-                    // 每次滚动检查前方缓冲，不够就补
-                    if (!isLoading && !endOfResults) {
-                        const bufferTarget = parseInt(uiSettings.preload_count, 10) || 40;
-                        const scrollH = imageGrid.scrollHeight;
-                        let viewedCount = 0;
-                        if (scrollH > 0) {
-                            const viewedRatio = Math.min(1, (imageGrid.scrollTop + imageGrid.clientHeight) / scrollH);
-                            viewedCount = Math.floor(posts.length * viewedRatio);
-                        }
-                        const aheadBuffer = posts.length - viewedCount;
-                        if (aheadBuffer < bufferTarget) {
-                            logger.info(`[scrollHandler] 触发: aheadBuffer=${aheadBuffer}<${bufferTarget} posts=${posts.length} viewedCount=${viewedCount}`);
-                            setTimeout(() => fetchAndRender(false), 0);
-                        } else {
-                            logger.debug(`[scrollHandler] 跳过: aheadBuffer=${aheadBuffer}>=${bufferTarget}`);
-                        }
-                    } else {
-                        logger.debug(`[scrollHandler] 跳过: isLoading=${isLoading} endOfResults=${endOfResults}`);
+                viewport = new GalleryViewport(imageGrid, createPostElement, range => {
+                    if (range.first && currentVisiblePage !== range.first.page) {
+                        currentVisiblePage = range.first.page;
+                        updatePaginationControls();
                     }
-
-                    // Debounced scroll logic for page indicator
-                    clearTimeout(scrollTimeout);
-                    scrollTimeout = setTimeout(updateCurrentPageIndicator, 150);
+                    maybeLoadMore();
                 });
+                imageGrid.addEventListener('scroll', () => {
+                    tooltipSuppressedUntil = performance.now() + 180;
+                    cancelLater(globalTooltipTimeout);
+                    globalTooltipTimeout = null;
+                    currentTooltipId++;
+                    if (globalTooltip) globalTooltip.style.display = 'none';
+                }, { passive: true, signal: lifetime.signal });
 
                 searchInput.addEventListener("keydown", (e) => {
                     if (e.key === "Enter") {
@@ -4882,10 +4728,10 @@ app.registerExtension({
                     dialog.appendChild($el('h3', { textContent: historyView ? 'D站历史记录' : 'D站离线缓存' }));
                     const content = $el('div');
                     dialog.appendChild(content);
-                    const close = () => { dialog.close(); dialog.remove(); };
+                    const close = () => { dialog.close(); removeOwned(dialog); };
                     dialog.addEventListener('cancel', (event) => { event.preventDefault(); close(); });
                     dialog.appendChild(offlineAction('关闭', close));
-                    document.body.appendChild(dialog);
+                    document.body.appendChild(own(dialog));
                     dialog.showModal();
                     let offset = 0;
                     const refresh = async () => {
@@ -4926,6 +4772,8 @@ app.registerExtension({
                             content.appendChild(offlineAction('清空离线数据', async () => {
                                 if (!window.confirm(`清空当前账号的 ${state.histories} 条历史和 ${state.posts} 张图片的离线缓存？此操作无法撤销。`)) return;
                                 await offlineRequest('delete', { confirmed: true });
+                                galleryThumbnails.invalidate(`${offlineScope}:`);
+                                thumbnailStates.clear();
                                 offlineHistory = '';
                                 await refresh();
                             }));
@@ -5045,16 +4893,6 @@ app.registerExtension({
                 bottomStatusBar.appendChild(paginationControls);
                 bottomStatusBar.appendChild(selectionCountBadge);
                 container.appendChild(bottomStatusBar);
-
-                const insertNewPost = (post) => {
-                    const newElement = createPostElement(post, currentVisiblePage);
-                    if (newElement) {
-                        imageGrid.prepend(newElement);
-                        newElement.classList.add('new-item');
-                        newElement.addEventListener('animationend', () => newElement.classList.remove('new-item'));
-                        resizeGrid();
-                    }
-                };
 
                 const updateEditedStatus = (wrapperElement, postId) => {
                     const originalPost = originalPostCache[postId]; // 从缓存中获取原始数据
@@ -5241,11 +5079,14 @@ app.registerExtension({
 
                         updateOfflineVisibility();
                         // 页面加载时直接获取第一页的帖子（先同步 currentTags，否则重置块会因 '' !== 搜索值而清空锚点）
+                        if (disposed) return;
+                        initialized = true;
                         currentTags = searchInput.value.trim();
                         logger.info(`[init] 开始首次加载: src=${uiSettings.source_site || "danbooru"} dedup=${uiSettings.gelbooru_dedup_mode || "off"} preload=${uiSettings.preload_count || 40} tags="${currentTags}"`);
                         fetchAndRender(true);
 
                     } catch (error) {
+                        if (disposed) return;
                         logger.error("Danbooru Gallery initialization failed:", error);
                         showError("图库初始化失败，请检查控制台日志。", true);
                     }
@@ -5287,19 +5128,30 @@ app.registerExtension({
                 };
 
                 const updateCurrentPageIndicator = () => {
-                    const gridRect = imageGrid.getBoundingClientRect();
-                    const firstVisibleChild = Array.from(imageGrid.children).find(child => {
-                        if (!child.dataset.galleryPage) return false;
-                        const rect = child.getBoundingClientRect();
-                        return rect.bottom > gridRect.top && rect.top < gridRect.bottom;
-                    });
-                    const visiblePage = normalizePageNumber(firstVisibleChild?.dataset.galleryPage);
-                    if (visiblePage) {
-                        currentVisiblePage = visiblePage;
-                    } else if (posts.length === 0) {
-                        currentVisiblePage = pageWindowStart;
-                    }
+                    const page = viewport.range.first?.page;
+                    if (page) currentVisiblePage = page;
+                    else if (posts.length === 0) currentVisiblePage = pageWindowStart;
                     updatePaginationControls();
+                    viewport.schedule();
+                };
+
+                this._galleryCleanup = () => {
+                    disposed = true;
+                    lifetime.abort();
+                    activePostsController?.abort();
+                    postsRequestGeneration++;
+                    cancelGelbooruPrefetch();
+                    viewport.destroy();
+                    recycledCards.length = 0;
+                    searchAutocomplete.destroy();
+                    for (const timer of timers) clearTimeout(timer);
+                    timers.clear();
+                    ownedElements.forEach(removeOwned);
+                    ownedElements.clear();
+                    selectedPosts.clear();
+                    thumbnailStates.clear();
+                    posts = [];
+                    postHydrationRequests.clear();
                 };
 
                 // 启动应用
@@ -5317,23 +5169,15 @@ app.registerExtension({
                         imageGrid.style.height = `${Math.max(120, height - controlsHeight - 10)}px`;
                     }
 
-                    cachedColumnWidth = 0;
                     scheduleResizeGrid();
                 }
             };
 
             const onRemoved = nodeType.prototype.onRemoved;
             nodeType.prototype.onRemoved = function () {
-                clearInterval(this._galleryLoadTimer);
-                this._galleryViewportCleanup?.();
+                this._galleryCleanup?.();
                 this._galleryFavoriteCleanup?.();
                 galleryQueuePreparers.delete(this);
-                // 移除所有可能由该节点创建的全局UI元素
-                const elementsToRemove = document.querySelectorAll(
-                    ".danbooru-settings-dialog, .danbooru-edit-panel, .danbooru-tag-tooltip, .danbooru-tag-context-menu, .danbooru-toast"
-                );
-                elementsToRemove.forEach(el => el.remove());
-
                 // 调用原始的 onRemoved 方法
                 onRemoved?.apply(this, arguments);
             };
@@ -5715,7 +5559,11 @@ $el("style", {
         border-color: #DC3545;
     }
     .danbooru-favorites-button .icon { width: 16px; height: 16px; }
-    .danbooru-image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); grid-gap: 5px; grid-auto-rows: 1px; overflow-y: auto; background-color: var(--comfy-input-bg); padding: 5px; border-radius: 4px; flex-grow: 1; height: 0; }
+    .danbooru-image-grid { display: block; overflow-y: auto; overflow-anchor: none; scrollbar-gutter: stable; background-color: var(--comfy-input-bg); padding: 5px; border-radius: 4px; flex-grow: 1; height: 0; position: relative; }
+    .danbooru-virtual-content { position: relative; width: 100%; contain: layout style; }
+    .danbooru-virtual-content > .danbooru-image-wrapper { position: absolute !important; box-sizing: border-box; contain: layout style; }
+    .danbooru-virtual-content > .danbooru-error-wrapper { overflow: auto !important; }
+    .danbooru-image-grid > .danbooru-loading { position: sticky; bottom: 0; background: var(--comfy-input-bg); z-index: 20; }
     .danbooru-image-wrapper {
         grid-row-start: auto;
         align-self: start;
@@ -5797,8 +5645,9 @@ $el("style", {
         justify-content: center !important;
         cursor: pointer !important;
         transition: all 0.2s ease !important;
-        backdrop-filter: blur(5px) !important;
-        -webkit-backdrop-filter: blur(5px) !important;
+        /* Repeated thumbnail controls must not resample the scrolling backdrop. */
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
         padding: 0 !important;
         margin: 0 !important;
     }
@@ -5899,9 +5748,10 @@ $el("style", {
     /* All button styles are now handled by .danbooru-image-buttons and its children. */
     /* The individual hover/visibility rules are replaced by the container's hover effect. */
     
-    .danbooru-image-grid img {
+    .danbooru-image-grid .danbooru-thumbnail {
         width: 100%;
-        height: auto;
+        height: 100%;
+        object-fit: contain;
         cursor: pointer;
         display: block;
     }
