@@ -308,6 +308,20 @@ async def main():
                 assert requests.count('/danbooru_gallery/offline/thumbnail') == before
                 checks.append('warm nearby backtracking sends zero thumbnail requests')
 
+                await page.evaluate('''async()=>{const {app}=await import('/scripts/app.js');
+                    app.canvas={ds:{scale:.05}};nodes[0].onDrawBackground();}''')
+                await asyncio.sleep(.6)
+                await page.wait_for_function("[...document.querySelectorAll('.danbooru-thumbnail')].every(c=>Math.max(c.width,c.height)<=64&&c.dataset.loaded==='true')")
+                for scale in (.8, .2, 1, .05):
+                    await page.evaluate('async s=>{const {app}=await import("/scripts/app.js");app.canvas.ds.scale=s;nodes[0].onDrawBackground();}', scale)
+                    await asyncio.sleep(.05)
+                await asyncio.sleep(.4)
+                assert await page.evaluate("[...document.querySelectorAll('.danbooru-thumbnail')].every(c=>Math.max(c.width,c.height)<=64)")
+                await page.evaluate('async()=>{const {app}=await import("/scripts/app.js");app.canvas.ds.scale=1;nodes[0].onDrawBackground();}')
+                await page.wait_for_function("[...document.querySelectorAll('.danbooru-thumbnail')].some(c=>Math.max(c.width,c.height)>64)")
+                assert requests.count('/danbooru_gallery/offline/thumbnail') == before
+                checks.append('zoom downscales decoded pixels, debounces rapid changes and restores detail without refetching')
+
                 await page.locator('.danbooru-image-wrapper .danbooru-thumbnail').first.hover()
                 await page.locator('.danbooru-tag-tooltip').wait_for(state='visible')
                 translations = requests.count('/danbooru_gallery/translate_tags_batch')

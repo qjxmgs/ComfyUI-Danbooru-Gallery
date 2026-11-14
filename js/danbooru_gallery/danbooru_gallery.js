@@ -1,7 +1,7 @@
 import { app } from "/scripts/app.js";
 import { $el } from "/scripts/ui.js";
 import { GalleryViewport } from "./gallery_viewport.js";
-import { galleryThumbnails } from "./gallery_thumbnails.js";
+import { galleryThumbnails, thumbnailTier } from "./gallery_thumbnails.js";
 import { globalAutocompleteCache } from "../global/autocomplete_cache.js";
 import { AutocompleteUI } from "../global/autocomplete_ui.js";
 import { toastManagerProxy } from "../global/toast_manager.js";
@@ -4046,6 +4046,7 @@ app.registerExtension({
                         thumbnailStates.set(thumbnailKey, thumbnailState);
                     }
                     let thumbnailHandle = null;
+                    let thumbnailSize = 384, pendingSize = 384, resolutionTimer = null;
                     let cardDisposed = false;
                     const thumbnailStatus = part('status', 'span', { textContent: '等待加载…' });
                     const retryThumbnailButton = part('retry', 'button', {
@@ -4421,22 +4422,40 @@ app.registerExtension({
                             retryThumbnailButton.style.display = entry.status === 'error' ? '' : 'none';
                             thumbnailStatus.textContent = entry.status === 'loading' ? '正在加载…'
                                 : entry.status === 'error' ? (usingLocal() ? '本地暂无缩略图' : '缩略图暂未加载，标签仍可使用') : '等待加载…';
-                            if (entry.bitmap && img._bitmap !== entry.bitmap) {
-                                img.width = entry.bitmap.width;
-                                img.height = entry.bitmap.height;
-                                img.getContext('2d').drawImage(entry.bitmap, 0, 0);
+                            if (entry.bitmap && (img._bitmap !== entry.bitmap || img.dataset.size !== String(thumbnailSize))) {
+                                const scale = Math.min(1, thumbnailSize / Math.max(entry.bitmap.width, entry.bitmap.height));
+                                img.width = Math.max(1, Math.round(entry.bitmap.width * scale));
+                                img.height = Math.max(1, Math.round(entry.bitmap.height * scale));
+                                img.getContext('2d').drawImage(entry.bitmap, 0, 0, img.width, img.height);
                                 img._bitmap = entry.bitmap;
+                                img.dataset.size = String(thumbnailSize);
                                 img.dataset.loaded = 'true';
                                 thumbnailPlaceholder.style.display = 'none';
                                 img.style.visibility = '';
-                                if (layoutEntry) viewport.setRatio(layoutEntry, img.width, img.height);
+                                if (layoutEntry) viewport.setRatio(layoutEntry, entry.dimensions.width || img.width, entry.dimensions.height || img.height);
                             }
-                        }, thumbnailState, !usingLocal() && !post._local_favorite);
+                        }, thumbnailState, !usingLocal() && !post._local_favorite, thumbnailSize);
                         observeGelbooruPrefetch(wrapper, post);
                     };
                     wrapper._setPriority = priority => thumbnailHandle?.priority(priority);
+                    wrapper._setResolution = pixels => {
+                        const size = thumbnailTier(pixels, thumbnailHandle ? thumbnailSize : 0);
+                        if (!thumbnailHandle) { thumbnailSize = pendingSize = size; return; }
+                        if (size === pendingSize) return;
+                        pendingSize = size;
+                        cancelLater(resolutionTimer);
+                        resolutionTimer = null;
+                        if (size === thumbnailSize) return;
+                        resolutionTimer = later(() => {
+                            resolutionTimer = null;
+                            if (cardDisposed) return;
+                            thumbnailSize = pendingSize;
+                            thumbnailHandle.size(thumbnailSize);
+                        }, 300);
+                    };
                     wrapper._dispose = () => {
                         cardDisposed = true;
+                        cancelLater(resolutionTimer);
                         thumbnailHandle?.release();
                         gelbooruPrefetchObserver?.unobserve(wrapper);
                         // Release canvas backing pixels immediately, independently of browser GC.
@@ -5158,6 +5177,7 @@ app.registerExtension({
                 initializeApp();
 
                 this.onResize = (size) => {
+                    viewport.setPixelRatio((app.canvas?.ds?.scale || 1) * (window.devicePixelRatio || 1));
                     const [width, height] = size;
                     const contentWidth = Math.max(150, width - 24);
                     container.style.width = `${contentWidth}px`;
@@ -5171,6 +5191,11 @@ app.registerExtension({
 
                     scheduleResizeGrid();
                 }
+                const originalDrawBackground = this.onDrawBackground;
+                this.onDrawBackground = function () {
+                    originalDrawBackground?.apply(this, arguments);
+                    if (!disposed) viewport.setPixelRatio((app.canvas?.ds?.scale || 1) * (window.devicePixelRatio || 1));
+                };
             };
 
             const onRemoved = nodeType.prototype.onRemoved;

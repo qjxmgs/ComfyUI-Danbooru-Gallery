@@ -49,6 +49,7 @@ export class GalleryViewport {
         this.destroyed = false;
         this.visible = true;
         this.lastScroll = 0;
+        this.pixelRatio = globalThis.devicePixelRatio || 1;
         this.range = { first: null, lastIndex: -1 };
         this.onScroll = () => this.schedule();
         scroller.addEventListener('scroll', this.onScroll, { passive: true });
@@ -66,6 +67,12 @@ export class GalleryViewport {
     append(post, page) {
         this.entries.push({ post, page, index: this.entries.length });
         this.dirty = true;
+        this.schedule();
+    }
+
+    setPixelRatio(value) {
+        if (Math.abs(value - this.pixelRatio) < .001) return;
+        this.pixelRatio = value;
         this.schedule();
     }
 
@@ -173,6 +180,7 @@ export class GalleryViewport {
                 card._geometry = geometry;
             }
             card._priority = priority(entry);
+            card._setResolution?.(Math.max(entry.width - 4, entry.height - 4) * this.pixelRatio);
             card._setPriority?.(card._priority);
         }
         this.content.append(fragment);

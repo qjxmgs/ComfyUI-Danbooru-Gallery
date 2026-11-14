@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { layoutCards, cardsInRange } from '../js/danbooru_gallery/gallery_viewport.js';
-import { ThumbnailPool } from '../js/danbooru_gallery/gallery_thumbnails.js';
+import { ThumbnailPool, thumbnailTier } from '../js/danbooru_gallery/gallery_thumbnails.js';
 
 test('10,000 mixed aspect cards have bounded viewport ranges and stable append positions', () => {
     const entries = Array.from({ length: 10000 }, (_, index) => ({ index, post: {
@@ -24,6 +24,40 @@ test('10,000 mixed aspect cards have bounded viewport ranges and stable append p
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
 const state = () => ({ attempts: 0, retryAt: 0 });
 const makePool = options => new ThumbnailPool({ decode: async () => ({ width: 1, height: 1, close() {} }), ...options });
+
+test('resolution tiers keep a hysteresis band near boundaries', () => {
+    assert.equal(thumbnailTier(120), 128);
+    assert.equal(thumbnailTier(135, 128), 128);
+    assert.equal(thumbnailTier(150, 128), 192);
+    assert.equal(thumbnailTier(120, 192), 192);
+    assert.equal(thumbnailTier(100, 192), 128);
+    assert.equal(thumbnailTier(30), 64);
+    assert.equal(thumbnailTier(900), 384);
+});
+
+test('resizing shares source bytes, closes old pixels, and serves the largest subscriber', async () => {
+    const original = globalThis.fetch;
+    let requests = 0, closed = 0;
+    globalThis.fetch = async () => { requests++; return new Response(new Blob(['source'])); };
+    const pool = new ThumbnailPool({ decode: async (_blob, size) => ({width:size,height:size,close(){closed++;}}) });
+    try {
+        const small = pool.acquire('one', '/one', 0, () => {}, state(), true, 64);
+        for (let i = 0; i < 20 && pool.entries.get('one').status !== 'ready'; i++) await tick();
+        assert.equal(pool.entries.get('one').bitmap.width, 64);
+        const large = pool.acquire('one', '/one', 0, () => {}, state(), true, 256);
+        await tick();
+        assert.equal(pool.entries.get('one').bitmap.width, 256);
+        large.release();
+        await tick();
+        assert.equal(pool.entries.get('one').bitmap.width, 64);
+        small.size(384);
+        await tick();
+        assert.equal(pool.entries.get('one').bitmap.width, 384);
+        assert.equal(requests, 1);
+        assert.equal(closed, 3);
+        small.release();
+    } finally { pool.invalidate(''); globalThis.fetch = original; }
+});
 
 test('missing or invalid dimensions retain finite placeholder geometry', () => {
     const entries = [
@@ -110,7 +144,7 @@ test('decoded pixels count toward the budget and eviction closes the bitmap', as
     try {
         const handle = pool.acquire('pixels', '/pixels', 0, () => {}, state());
         await tick();
-        assert.equal(pool.entries.get('pixels').bytes, 400);
+        assert.equal(pool.entries.get('pixels').bytes, 421);
         handle.release();
         assert.equal(pool.entries.size, 0);
         assert.equal(closed, 1);
