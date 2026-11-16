@@ -251,6 +251,11 @@ async def main():
                 await page.goto(str(server.make_url('/')))
                 await page.wait_for_function('window.ready && nodes[0]._qa.count()>=42 && !nodes[0]._qa.loading()')
                 await page.wait_for_function("document.querySelector('.danbooru-image-grid .danbooru-thumbnail')?.dataset.loaded==='true'")
+                assert await page.evaluate("""[...document.querySelectorAll('.danbooru-thumbnail')]
+                    .filter(c => c.dataset.loaded === 'true')
+                    .every(c => c.getContext('2d').getContextAttributes().willReadFrequently)""")
+                assert await page.locator('.danbooru-pagination-controls').evaluate("e => getComputedStyle(e).backdropFilter === 'none'")
+                checks.append('static thumbnails use software canvases and pagination has no backdrop blur')
                 await page.evaluate('nodes[0]._qa.prepareSelectionForQueue()')
                 restored = await page.evaluate("JSON.parse(nodes[0].widgets.find(w=>w.name==='selection_data').value).selections")
                 assert restored[0]['post_id'] == 'saved-workflow-post' and restored[0]['prompt'] == 'saved workflow prompt'

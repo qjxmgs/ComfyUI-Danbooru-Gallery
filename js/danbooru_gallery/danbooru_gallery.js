@@ -4166,7 +4166,7 @@ app.registerExtension({
 
                     // 使用全局tooltip实例
                     if (!globalTooltip) {
-                        globalTooltip = $el("div.danbooru-tag-tooltip", { style: { display: "none", position: "absolute", zIndex: "1000" } });
+                        globalTooltip = $el("div.danbooru-tag-tooltip", { style: { display: "none", position: "fixed", zIndex: "1000" } });
                         const tagsContainer = $el("div", { className: "danbooru-tooltip-tags" });
                         globalTooltip.appendChild(tagsContainer);
                         document.body.appendChild(own(globalTooltip));
@@ -4281,6 +4281,11 @@ app.registerExtension({
                             }
                         });
 
+                        const galleryRect = container.getBoundingClientRect();
+                        const tooltipLeft = galleryRect.right + 12;
+                        globalTooltip.style.left = `${tooltipLeft}px`;
+                        globalTooltip.style.top = `${Math.max(8, galleryRect.top)}px`;
+                        globalTooltip.style.width = `${Math.min(600, Math.max(240, window.innerWidth - tooltipLeft - 8))}px`;
                         globalTooltip._owner = wrapper;
                         globalTooltip.style.display = "block";
 
@@ -4327,17 +4332,7 @@ app.registerExtension({
                         }
                     };
 
-                    wrapper.onmousemove = (e) => {
-                        queueTooltip();
-                        if (globalTooltip.style.display !== 'block') return;
-                        const rect = globalTooltip.getBoundingClientRect();
-                        const buffer = 15;
-                        let newLeft = e.clientX + buffer, newTop = e.clientY + buffer;
-                        if (newLeft + rect.width > window.innerWidth) newLeft = e.clientX - rect.width - buffer;
-                        if (newTop + rect.height > window.innerHeight) newTop = e.clientY - rect.height - buffer;
-                        globalTooltip.style.left = `${newLeft + window.scrollX}px`;
-                        globalTooltip.style.top = `${newTop + window.scrollY}px`;
-                    };
+                    wrapper.onmousemove = queueTooltip;
 
                     const isFavorited = Boolean(post._local_favorite) || userFavorites.includes(String(post.id));
                     const favoriteButton = part('favorite', "button.danbooru-favorite-button", {
@@ -4426,7 +4421,9 @@ app.registerExtension({
                                 const scale = Math.min(1, thumbnailSize / Math.max(entry.bitmap.width, entry.bitmap.height));
                                 img.width = Math.max(1, Math.round(entry.bitmap.width * scale));
                                 img.height = Math.max(1, Math.round(entry.bitmap.height * scale));
-                                img.getContext('2d').drawImage(entry.bitmap, 0, 0, img.width, img.height);
+                                // Static thumbnails do not need a GPU-backed canvas per card.
+                                // Keep rasterization off the GPU used by workflow sampling.
+                                img.getContext('2d', { willReadFrequently: true }).drawImage(entry.bitmap, 0, 0, img.width, img.height);
                                 img._bitmap = entry.bitmap;
                                 img.dataset.size = String(thumbnailSize);
                                 img.dataset.loaded = 'true';
@@ -5475,7 +5472,7 @@ $el("style", {
         border-radius: 6px;
         background: rgba(0, 0, 0, 0.72);
         color: white;
-        backdrop-filter: blur(5px);
+        backdrop-filter: none;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
     }
     .danbooru-page-indicator { min-width: 72px; padding: 0 4px; font-size: 12px; text-align: center; white-space: nowrap; }
@@ -5792,6 +5789,7 @@ $el("style", {
         }
     
         .danbooru-tag-tooltip {
+            box-sizing: border-box;
             background-color: rgba(28, 29, 31, 0.9);
             border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 6px;
